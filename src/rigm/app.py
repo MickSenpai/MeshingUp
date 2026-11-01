@@ -49,7 +49,7 @@ from .project import (
 )
 from .rig import generate_layer_mesh, posed_joint_positions, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES
-from .avatar3d import attach_avatar, autorig_glb, validate_project_avatar
+from .avatar3d import attach_avatar, autorig_glb, create_avatar_project, validate_project_avatar
 from .avatar3d_viewer import Avatar3DDialog
 from .export import export_bundle
 from .decomposition import decompose_project_with_see_through
@@ -183,14 +183,18 @@ class RigCanvas(QGraphicsView):
         self.target_pick_mode = False
         self.ik_target: tuple[float, float] | None = None
 
-    def set_image(self, path: Path) -> None:
-        image = QPixmap(str(path))
-        if image.isNull():
-            raise ValueError("No pude leer esa imagen.")
+    def set_image(self, path: Path | None) -> None:
+        if path is None:
+            image = QPixmap(640, 480)
+            image.fill(QColor("#252a36"))
+        else:
+            image = QPixmap(str(path))
+            if image.isNull():
+                raise ValueError(f"No pude leer «{path}» como imagen 2D.")
         self.image = image
         self.composite_preview = None
         self.preview_enabled = False
-        self.image_path = path.resolve()
+        self.image_path = path.resolve() if path is not None else None
         self.joints.clear()
         self.preview_joint_positions = None
         self.bones.clear()
@@ -223,10 +227,25 @@ class RigCanvas(QGraphicsView):
         self.viewport().update()
 
     def load_model(self, data: dict[str, Any], project_path: Path) -> None:
-        image_path = Path(data["image"])
-        if not image_path.is_absolute():
-            image_path = (project_path.parent / image_path).resolve()
-        self.set_image(image_path)
+        image_value = data.get("image")
+        image_error = None
+        if image_value:
+            image_path = Path(image_value)
+            if not image_path.is_absolute():
+                image_path = (project_path.parent / image_path).resolve()
+            try:
+                self.set_image(image_path)
+            except ValueError as exc:
+                image_error = exc
+                self.set_image(None)
+        else:
+            image_error = "Este proyecto no tiene una imagen 2D de origen."
+            self.set_image(None)
+        if (not image_value or image_error) and not data.get("avatar3d"):
+            raise ProjectError(
+                f"No se puede abrir el editor 2D: {image_error or 'falta la imagen fuente'}. "
+                "Registra el archivo de imagen original o crea un proyecto desde un GLB/VRM."
+            )
         self.joints = list(data.get("joints", []))
         self.bones = [list(edge) for edge in data.get("bones", [])]
         self.layers = list(data.get("layers", []))
@@ -951,6 +970,8 @@ class MainWindow(QMainWindow):
         library_buttons = QHBoxLayout()
         new_project_button = QPushButton("Crear rig desde imagen…")
         new_project_button.clicked.connect(self.create_new_project)
+        new_avatar_project_button = QPushButton("Crear proyecto 3D desde GLB / VRM…")
+        new_avatar_project_button.clicked.connect(self.create_avatar3d_project)
         import_project_button = QPushButton("Registrar proyecto existente…")
         import_project_button.clicked.connect(self.open_project)
         open_selected_button = QPushButton("Abrir seleccionado")
@@ -962,6 +983,7 @@ class MainWindow(QMainWindow):
         refresh_button = QPushButton("Actualizar")
         refresh_button.clicked.connect(self.refresh_library)
         library_buttons.addWidget(new_project_button)
+        library_buttons.addWidget(new_avatar_project_button)
         library_buttons.addWidget(import_project_button)
         library_buttons.addWidget(open_selected_button)
         library_buttons.addWidget(validate_button)
@@ -1006,6 +1028,8 @@ class MainWindow(QMainWindow):
             if self.behavior_runtime:
                 self.behavior_enabled.setChecked(False)
             self.canvas.set_image(Path(path))
+            self.tool_tabs.setTabEnabled(0, True)
+            self.tool_tabs.setCurrentIndex(0)
             self._reset_prompt_tools()
             self.project_path = None
             self.loaded_mtime_ns = None
@@ -1043,6 +1067,32 @@ class MainWindow(QMainWindow):
         except (OSError, ProjectError) as exc:
             QMessageBox.warning(self, "No pude crear el rig", str(exc))
 
+    def create_avatar3d_project(self) -> None:
+        model, _ = QFileDialog.getOpenFileName(
+            self, "Elegir avatar 3D", str(Path.home()), "Modelos 3D (*.glb *.vrm)",
+        )
+        if not model:
+            return
+        model_path = Path(model)
+        default_dir = Path.home() / "RigM" / "Projects"
+        default_dir.mkdir(parents=True, exist_ok=True)
+        suggested = str(default_dir / f"{model_path.stem}.rigm")
+        output, _ = QFileDialog.getSaveFileName(self, "Crear proyecto 3D RigM", suggested, PROJECT_FILTER)
+        if not output:
+            return
+        project_path = Path(output)
+        if project_path.suffix.casefold() != ".rigm":
+            project_path = project_path.with_suffix(".rigm")
+        try:
+            create_avatar_project(model_path, project_path, name=project_path.stem, actor="user")
+            self.library.add(project_path)
+            self._open_project_file(project_path)
+            self.refresh_library()
+            self.tool_tabs.setCurrentIndex(1)
+            self._open_avatar3d_viewer()
+        except (OSError, ProjectError) as exc:
+            QMessageBox.warning(self, "No pude crear el proyecto 3D", str(exc))
+
     def open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Abrir proyecto RigM", "", PROJECT_FILTER)
         if not path:
@@ -1065,6 +1115,8 @@ class MainWindow(QMainWindow):
         self.preview_layer_opacities.clear()
         self.preview_layer_visibility.clear()
         self.project_path = project_path.resolve()
+        has_2d_source = self.canvas.image_path is not None
+        self.tool_tabs.setTabEnabled(0, has_2d_source)
         self.avatar3d_attach_button.setEnabled(True)
         avatar = data.get("avatar3d", {})
         if not isinstance(avatar, dict):
@@ -1082,6 +1134,11 @@ class MainWindow(QMainWindow):
             else "Avatar VRM con esqueleto humanoide." if avatar.get("format") == "vrm"
             else "Importa un GLB o VRM. RigM puede proponer huesos para un GLB sin esqueleto."
         )
+        if not has_2d_source:
+            self.avatar3d_info.setText(
+                "Proyecto 3D sin imagen 2D. El visor, el auto-rig y las animaciones 3D están disponibles; "
+                "las herramientas de ilustración 2D quedan desactivadas."
+            )
         self.loaded_mtime_ns = self.project_path.stat().st_mtime_ns
         self.reload_button.setEnabled(False)
         self.joint_list.clear()
@@ -1092,6 +1149,10 @@ class MainWindow(QMainWindow):
         self._refresh_composite_preview(show_error=False)
         self._set_ready(True)
         self.status.setText(f"Proyecto: {data.get('name', project_path.stem)} · {data.get('stage', 'skeleton')}")
+        if not has_2d_source:
+            self.tool_tabs.setCurrentIndex(1)
+            self.preview_tabs.setCurrentIndex(1)
+            self.status.setText(f"Proyecto 3D: {data.get('name', project_path.stem)} · sin imagen 2D")
         self.tabs.setCurrentIndex(1)
 
     def _attach_avatar3d(self) -> None:
@@ -1252,7 +1313,7 @@ class MainWindow(QMainWindow):
         labels = {
             "in_progress": "En curso", "queued": "En cola", "needs_review": "Revisión",
             "ready": "Listo", "failed": "Falló", "missing": "Falta archivo",
-            "missing_source": "Falta imagen", "invalid": "Archivo inválido",
+            "missing_source": "Falta imagen 2D", "invalid": "Archivo inválido",
         }
         self.library_table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
@@ -2226,6 +2287,11 @@ class MainWindow(QMainWindow):
     def _refresh_composite_preview(self, show_error: bool = True) -> None:
         if self.project_path is None:
             return
+        if self.canvas.image_path is None or not self.canvas.layers:
+            self.canvas.composite_preview = None
+            self.preview_button.setEnabled(False)
+            self.preview_button.setChecked(False)
+            return
         try:
             composite = render_composite(self.project_path).convert("RGBA")
             image = QImage(
@@ -2281,6 +2347,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No pude recargar", str(exc))
 
     def save_project(self) -> None:
+        if self.canvas.image_path is None:
+            QMessageBox.information(
+                self, "Proyecto 3D", "Este proyecto no tiene imagen 2D. Los cambios del avatar se guardan desde el visor 3D."
+            )
+            return
         if self.canvas.image is None:
             return
         project_path = self.project_path
@@ -2311,6 +2382,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No pude guardar", str(exc))
 
     def _editor_project_data(self, path: Path | None = None) -> dict[str, Any]:
+        if self.canvas.image_path is None:
+            raise ProjectError("Este proyecto es sólo 3D; no tiene una imagen 2D que se pueda guardar desde el editor de ilustración.")
         path = path or self.project_path
         current = load_project(path) if path is not None and path.exists() else {}
         current.update({
@@ -2425,14 +2498,15 @@ class MainWindow(QMainWindow):
                                "Selecciona raíz, codo/rodilla y extremo en orden con Ctrl.")
 
     def _refresh_status(self) -> None:
-        if self.canvas.image:
+        if self.canvas.image and self.canvas.image_path is not None:
             self.add_button.setEnabled(True)
             self.save_button.setEnabled(True)
 
     def _set_ready(self, ready: bool) -> None:
-        self.add_button.setEnabled(ready)
-        self.save_button.setEnabled(ready)
-        self.export_button.setEnabled(ready and self.project_path is not None)
+        has_2d_source = self.canvas.image_path is not None
+        self.add_button.setEnabled(ready and has_2d_source)
+        self.save_button.setEnabled(ready and has_2d_source)
+        self.export_button.setEnabled(ready and has_2d_source and self.project_path is not None)
         self._refresh_status()
 
     def closeEvent(self, event) -> None:

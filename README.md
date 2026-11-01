@@ -19,6 +19,9 @@ La meta del producto incluye una biblioteca gráfica que verifique qué rigs exi
 - Añade un flujo de avatar 3D GLB/VRM con pestañas de vista 2D y 3D. El visor encuadra el modelo, muestra el esqueleto, permite ajustar pivotes y giros de huesos, y guarda las ediciones como una nueva versión GLB dentro del proyecto.
 - Puede proponer un rig humanoide para un GLB sin esqueleto, sin Blender. El análisis estima proporciones a partir de secciones de la geometría, calcula pesos por vértice y muestra el avance; para rigs creados anteriormente se puede volver a la fuente conservada y generarlos de nuevo. La inferencia es aproximada, especialmente para personajes estilizados: revisa la pose neutral, los pivotes y las deformaciones antes de animar.
 - El visor 3D permite previsualizar estados de reposo, escucha, pensamiento, habla e inquietud. Estos controles sirven para revisar el movimiento; la conexión automática con eventos en vivo de Meido aún no está integrada. La reproducción de clips y los controles faciales dependen de las animaciones, huesos o blend shapes incluidos en el modelo.
+- El auto-rig del visor Three.js crea un esqueleto humanoide y pesos desde la geometría localmente, sin Blender. Cuando faltan clips compatibles, genera clips glTF base para reposo, escucha, pensamiento, habla, espera, recuperación y ciclo de caminar, y los exporta junto con el GLB riggeado. La inferencia de proporciones y pesos es heurística; una revisión visual breve sigue siendo necesaria.
+- La biblioteca también puede crear proyectos `.rigm` 3D-only directamente desde GLB/VRM. La imagen fuente 2D es opcional para esos proyectos; si falta en un proyecto 2D antiguo, RigM aún puede abrir el avatar 3D y señala la fuente ausente.
+- Los estados del visor mezclan clips disponibles con movimiento procedural. Las señales de voz normalizadas (`tts.viseme`, `speech.viseme` y `speech.level`) animan expresiones/blend shapes o la mandíbula cuando el modelo las incluye. RigM no sintetiza voz ni deduce fonemas de texto/audio por sí solo; necesita recibir visemas o energía de un proveedor TTS.
 - Puede separar ilustraciones anime en capas semánticas con See-through (servicio de Hugging Face), importar el PSD y mantener el JPG original. La app pide consentimiento antes de enviar una copia.
 - Guarda y vuelve a abrir proyectos `.rigm` versionados con una copia portable de la imagen fuente.
 - Expone las operaciones disponibles con `rigmctl`, para que un agente pueda inspeccionar y modificar el mismo proyecto que la interfaz, incluidas la creación de capas, la importación de máscaras PNG y sprites RGBA de lienzo completo.
@@ -39,15 +42,18 @@ Requiere Python 3.10+, PyQt6 y Pillow:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[rigging,avatar3d]'
+cd viewer3d && npm ci && npm run build && cd ..
 rigm
 ```
+
+En Windows PowerShell usa `scripts\\install_windows.ps1`; en Linux usa `bash scripts/install_linux.sh`. Ambos crean `.venv`, instalan PyQt6/WebEngine y rigging, e instalan/compilan el visor local Three.js. Requieren Python 3.10+ y Node.js 20.19+ con npm. En Linux minimalista, Qt WebEngine puede requerir bibliotecas gráficas del sistema de la distribución.
 
 Para activar la reconstrucción local de zonas ocultas, instala el extra opcional: `python -m pip install -e '.[inpaint]'`.
 Para activar la segmentación SAM 2, instala: `python -m pip install -e '.[segmentation]'`.
 Para la separación completa anime con See-through, instala: `python -m pip install -e '.[decomposition]'` y autentícate con `.venv/bin/hf auth login`. El servicio recibe la imagen sólo después de aceptar el aviso de privacidad dentro de la app.
 Para activar mallas, deformación, IK y render de poses, instala: `python -m pip install -e '.[rigging]'`.
-Para habilitar el visor 3D, instala RigM en un entorno virtual con `python -m pip install -e '.[avatar3d]'`. La vista central ofrece pestañas **Vista 2D** y **Vista 3D**. Al importar un GLB/VRM, RigM lo abre en el visor y ajusta su escala y encuadre. En un GLB sin esqueleto, **Analizar modelo y crear esqueleto** estima el rig y los pesos dentro del visor. Selecciona la dirección frontal antes del análisis. Para corregir una propuesta guardada, **Rehacer esqueleto desde fuente** carga el GLB original conservado en el proyecto; luego pulsa **Crear esqueleto sin Blender** en el visor. El esqueleto se muestra sobre el modelo: selecciona huesos para ajustar pivotes y rotaciones; **Guardar rig/pose editados** guarda otra versión y conserva los archivos previos. El análisis no reconstruye anatomía oculta, tiene límites con modelos no humanoides y siempre requiere revisión visual. Blender es opcional. También puedes usar `rigmctl avatar3d validate-file modelo.glb`, `rigmctl avatar3d attach proyecto.rigm modelo.glb` y `rigmctl avatar3d autorig proyecto.rigm --forward-axis=-Y` para el flujo externo existente.
+Para habilitar el visor 3D, instala el extra `avatar3d` con uno de los scripts de plataforma. La vista central ofrece pestañas **Vista 2D** y **Vista 3D**. Al importar un GLB/VRM, RigM lo abre en el visor y ajusta su escala y encuadre. En un GLB sin esqueleto, **Analizar modelo y crear esqueleto** calcula huesos y pesos en Three.js. Selecciona la dirección frontal antes del análisis. El visor también añade clips base cuando faltan movimientos compatibles y los guarda en el GLB riggeado. Para corregir una propuesta guardada, **Rehacer esqueleto desde fuente** carga el GLB original conservado en el proyecto. El esqueleto se muestra sobre el modelo: selecciona huesos para ajustar pivotes y rotaciones; **Guardar rig/pose editados** guarda otra versión y conserva los archivos previos. El análisis no reconstruye anatomía oculta, tiene límites con modelos no humanoides y requiere una revisión visual.
 
 El comando `rigmctl --help` muestra la interfaz estructurada para listar, crear, inspeccionar y validar proyectos; modificar pivotes, huesos, capas y progreso. Es la base para que un agente opere RigM sin simular clics de ratón.
 
@@ -82,7 +88,7 @@ La separación completa anime requiere el extra `decomposition` y una sesión de
 
 ## Uso
 
-1. En **Biblioteca**, crea un rig desde una imagen o registra un proyecto `.rigm` existente.
+1. En **Biblioteca**, crea un rig desde una imagen, crea un proyecto 3D desde un GLB/VRM o registra un proyecto `.rigm` existente.
 2. Abre un proyecto para pasar al **Editor**.
 3. Pulsa **Añadir pivote** y haz clic en cada articulación.
 4. Selecciona dos pivotes con Ctrl y pulsa **Conectar selección**.
@@ -109,5 +115,7 @@ La validación comprueba referencias, máscaras, sprites y reconstrucciones. Mar
 6. Faltan deshacer/rehacer, relleno semántico de zonas ocultas, cambios animados de orden de dibujo y validación visual automática con evidencia.
 
 Las poses de manos y su procedencia se describen en [Poses de capa y manos](docs/POSES_DE_CAPA_Y_MANOS.md).
+
+El comando CLI histórico `rigmctl avatar3d autorig` aún usa el script externo de Blender; el flujo recomendado para generar el rig y clips base sin Blender es **Analizar modelo y crear esqueleto** desde el visor 3D. Las animaciones de habla usan señales de visemas/energía que debe enviar la integración TTS; todavía no se generan fonemas desde texto ni hay conexión automática en vivo con Meido.
 
 RigM ya permite construir y revisar manualmente un rig deformable y animarlo; la automatización integral desde una sola imagen sigue siendo una etapa futura. La [investigación de rigging 2D](docs/INVESTIGACION_RIG_2D.md) recoge los criterios de calidad.

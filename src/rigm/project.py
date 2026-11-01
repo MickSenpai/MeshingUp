@@ -45,8 +45,11 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def resolve_image(data: dict[str, Any], project_path: Path) -> Path:
-    image_path = Path(data["image"])
+def resolve_image(data: dict[str, Any], project_path: Path) -> Path | None:
+    image_value = data.get("image")
+    if not image_value:
+        return None
+    image_path = Path(image_value)
     if not image_path.is_absolute():
         image_path = project_path.parent / image_path
     return image_path.resolve()
@@ -76,7 +79,8 @@ def load_project(path: str | Path) -> dict[str, Any]:
                 joint.setdefault("parent", None)
             joint.setdefault("rotation", 0.0)
     data["_path"] = str(project_path)
-    data["_image_path"] = str(resolve_image(data, project_path))
+    resolved_image = resolve_image(data, project_path)
+    data["_image_path"] = str(resolved_image) if resolved_image else None
     return data
 
 
@@ -112,7 +116,23 @@ def save_project(
     payload.setdefault("name", project_path.stem)
     payload.setdefault("created_at", now_utc())
     payload["updated_at"] = now_utc()
-    payload["image"] = _portable_image(data, project_path)
+    image_value = data.get("_image_path") or data.get("image")
+    if image_value:
+        source_image = Path(image_value).expanduser()
+        if not source_image.is_absolute():
+            source_image = project_path.parent / source_image
+        if source_image.is_file():
+            payload["image"] = _portable_image(data, project_path)
+        elif data.get("image"):
+            # Preserve a stale source reference so a 3D avatar can still be
+            # edited and the missing 2D asset can be reported by validation.
+            payload["image"] = data["image"]
+        else:
+            payload.pop("image", None)
+            payload.pop("image_size", None)
+    else:
+        payload.pop("image", None)
+        payload.pop("image_size", None)
     payload.setdefault("status", "in_progress")
     payload.setdefault("stage", "skeleton")
     payload.setdefault("progress", 0)
@@ -818,11 +838,14 @@ def validate_project(path: str | Path) -> dict[str, Any]:
     source_size = None
     try:
         image_path = resolve_image(data, project_path)
-        if not image_path.is_file():
-            errors.append(f"Falta la imagen de referencia: {image_path}")
-        else:
-            with Image.open(image_path) as image:
-                source_size = image.size
+        if image_path is not None:
+            if not image_path.is_file():
+                errors.append(f"Falta la imagen de referencia: {image_path}")
+            else:
+                with Image.open(image_path) as image:
+                    source_size = image.size
+        elif not data.get("avatar3d"):
+            errors.append("El proyecto no tiene una imagen 2D ni un avatar 3D.")
     except (KeyError, OSError) as exc:
         errors.append(f"Referencia de imagen inválida: {exc}")
 
