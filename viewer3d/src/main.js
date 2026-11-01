@@ -635,47 +635,56 @@ async function createGeometricRig(forwardAxis = '+Z') {
     .reduce((best, slice) => !best || slice.width < best.width ? slice : best, null);
   const hasChibiHead = Boolean(headPeak && neckSlice && headPeak.width > neckSlice.width * 1.32 && headPeak.y - neckSlice.y > .07);
   const neckRatio = hasChibiHead ? neckSlice.y : .82;
-  const shoulderRatio = Math.max(.48, Math.min(.82, neckRatio - .035));
+  const shoulderPriorRatio = Math.max(.48, Math.min(.82, neckRatio - .035));
+  const shoulderSearch = profile.filter((slice) => slice.width > 0 && slice.y >= .42 && slice.y <= .60);
+  const shoulderPeak = shoulderSearch.reduce((best, slice) => !best || slice.width > best.width ? slice : best, null);
+  const shoulderRatio = neckRatio < .70 && shoulderPeak ? shoulderPeak.y : shoulderPriorRatio;
   const hipRatio = Math.max(.27, shoulderRatio * .64);
   const spineRatio = hipRatio + (shoulderRatio - hipRatio) * .45;
   const chestRatio = hipRatio + (shoulderRatio - hipRatio) * .82;
   const headRatio = neckRatio + (1 - neckRatio) * .5;
   const jawRatio = neckRatio + (headRatio - neckRatio) * .20;
-  const shoulderSlice = profile.reduce((best, slice) => slice.width > 0 && Math.abs(slice.y - shoulderRatio) < Math.abs((best?.y ?? Infinity) - shoulderRatio) ? slice : best, null);
+  // Use the neck-based slice for torso width. In a T-pose the widest slice is
+  // often the arms, which would otherwise make the shoulder half-width too big.
+  const shoulderSlice = profile.reduce((best, slice) => slice.width > 0 && Math.abs(slice.y - shoulderPriorRatio) < Math.abs((best?.y ?? Infinity) - shoulderPriorRatio) ? slice : best, null);
+  const armsExtended = Boolean(shoulderPeak && shoulderSlice && shoulderPeak.width > shoulderSlice.width * 1.15);
   const centerSlices = profile.filter((slice) => slice.center !== null && slice.y >= hipRatio && slice.y <= shoulderRatio + .02);
   const bodyCenter = centerSlices.length ? centerSlices.reduce((sum, slice) => sum + slice.center, 0) / centerSlices.length : cx * side[0] + cz * side[1];
   const centerOffset = bodyCenter - (cx * side[0] + cz * side[1]);
   const point = (x, y, z) => avatarRoot.worldToLocal(new THREE.Vector3(x, y, z));
   const bodyPoint = (lateral, heightRatio, depth = 0) => point(cx + side[0] * (centerOffset + lateral) + forward[0] * depth, bounds.min.y + height * heightRatio, cz + side[1] * (centerOffset + lateral) + forward[1] * depth);
   const half = Math.max(height * .065, Math.min((shoulderSlice?.width || width * .35) * .43, height * .18));
-  const elbowRatio = shoulderRatio - (shoulderRatio - hipRatio) * .58;
   const handRatio = hipRatio + (shoulderRatio - hipRatio) * .12;
   const kneeRatio = hipRatio * .52;
   const worldShoulder = (sign) => avatarRoot.localToWorld(bodyPoint(sign * half * .45, shoulderRatio).clone());
-  const worldElbow = (sign) => avatarRoot.localToWorld(bodyPoint(sign * half * 1.55, elbowRatio).clone());
   const forwardVector = new THREE.Vector3(forward[0], 0, forward[1]).normalize();
   const sideVector = new THREE.Vector3(side[0], 0, side[1]).normalize();
   const bodyCenterX = cx + side[0] * centerOffset, bodyCenterZ = cz + side[1] * centerOffset;
   const inferHand = (sideName, sign) => {
-    const shoulder = worldShoulder(sign), elbow = worldElbow(sign);
+    const shoulder = worldShoulder(sign);
     const candidates = [];
-    const minY = bounds.min.y + height * Math.max(.08, hipRatio - .06);
-    const maxY = bounds.min.y + height * Math.min(shoulderRatio + .025, neckRatio - .045);
+    const armBand = armsExtended ? .025 : .14;
+    const minY = armsExtended
+      ? bounds.min.y + height * Math.max(.08, shoulderRatio - armBand)
+      : bounds.min.y + height * Math.max(.08, hipRatio - .06);
+    // Include arms extended at shoulder level and modestly raised; the old
+    // neck-clamped ceiling excluded T-pose wrists on chibi characters.
+    const maxY = bounds.min.y + height * (armsExtended ? Math.min(.78, shoulderRatio + armBand) : Math.min(.78, shoulderRatio + .14));
     for (let i = 0; i < pointSampleCount; i++) {
       const x = sampledPositions[i * 3], y = sampledPositions[i * 3 + 1], z = sampledPositions[i * 3 + 2];
       if (y < minY || y > maxY) continue;
       const lateral = ((x - bodyCenterX) * side[0] + (z - bodyCenterZ) * side[1]) * sign;
       if (lateral < half * .58) continue;
       const dx = x - shoulder.x, dy = y - shoulder.y, dz = z - shoulder.z;
-      candidates.push({ x, y, z, distance: dx * dx + dy * dy + dz * dz });
+      candidates.push({ x, y, z, lateral, distance: dx * dx + dy * dy + dz * dz });
     }
-    if (candidates.length < 12) return { position: bodyPoint(sign * half * 1.9, handRatio), direction: new THREE.Vector3(0, -1, 0), across: sideVector.clone().multiplyScalar(sign), length: height * .055, width: height * .035, inferred: false };
-    candidates.sort((a, b) => b.distance - a.distance);
-    const cutoff = candidates[Math.min(candidates.length - 1, Math.floor(candidates.length * .965))].distance;
-    const distal = candidates.filter((sample) => sample.distance >= cutoff);
+    if (candidates.length < 12) return { position: bodyPoint(sign * half * 1.9, handRatio), direction: new THREE.Vector3(0, -1, 0), across: sideVector.clone().multiplyScalar(sign), length: height * .055, width: height * .035, inferred: false, pose: 'fallback' };
+    const rank = armsExtended ? 'lateral' : 'distance';
+    candidates.sort((a, b) => b[rank] - a[rank]);
+    const cutoff = candidates[Math.min(candidates.length - 1, Math.floor(candidates.length * .965))][rank];
+    const distal = candidates.filter((sample) => sample[rank] >= cutoff);
     const endpointWorld = distal.reduce((sum, sample) => sum.add(new THREE.Vector3(sample.x, sample.y, sample.z)), new THREE.Vector3()).multiplyScalar(1 / distal.length);
-    const direction = endpointWorld.clone().sub(elbow).normalize();
-    if (direction.lengthSq() < .5) direction.copy(endpointWorld).sub(shoulder).normalize();
+    const direction = endpointWorld.clone().sub(shoulder).normalize();
     const wristWorld = endpointWorld.clone().addScaledVector(direction, -height * .035);
     const wrist = avatarRoot.worldToLocal(wristWorld.clone());
     let across = new THREE.Vector3().crossVectors(forwardVector, direction).normalize();
@@ -705,13 +714,19 @@ async function createGeometricRig(forwardAxis = '+Z') {
       inferred: true,
       sampleCount: distal.length,
       side: sideName,
+      pose: armsExtended ? 'extended' : 'relaxed',
     };
   };
   const hands = { left: inferHand('left', -1), right: inferHand('right', 1) };
+  const armPoint = (sign, fraction) => {
+    const shoulder = worldShoulder(sign);
+    const wrist = avatarRoot.localToWorld(hands[sign < 0 ? 'left' : 'right'].position.clone());
+    return avatarRoot.worldToLocal(shoulder.lerp(wrist, fraction));
+  };
   const joints = [
     ['hips', bodyPoint(0,hipRatio)], ['spine', bodyPoint(0,spineRatio)], ['chest', bodyPoint(0,chestRatio)], ['neck', bodyPoint(0,neckRatio)], ['head', bodyPoint(0,headRatio)], ['jaw', bodyPoint(0,jawRatio,height*.035)],
-    ['leftShoulder', bodyPoint(-half*.45,shoulderRatio)], ['leftUpperArm', bodyPoint(-half,shoulderRatio-.025)], ['leftLowerArm', bodyPoint(-half*1.55,elbowRatio)], ['leftHand', hands.left.position],
-    ['rightShoulder', bodyPoint(half*.45,shoulderRatio)], ['rightUpperArm', bodyPoint(half,shoulderRatio-.025)], ['rightLowerArm', bodyPoint(half*1.55,elbowRatio)], ['rightHand', hands.right.position],
+    ['leftShoulder', bodyPoint(-half*.45,shoulderRatio)], ['leftUpperArm', armPoint(-1,.32)], ['leftLowerArm', armPoint(-1,.72)], ['leftHand', hands.left.position],
+    ['rightShoulder', bodyPoint(half*.45,shoulderRatio)], ['rightUpperArm', armPoint(1,.32)], ['rightLowerArm', armPoint(1,.72)], ['rightHand', hands.right.position],
     ['leftUpperLeg', bodyPoint(-half*.38,hipRatio-.015)], ['leftLowerLeg', bodyPoint(-half*.4,kneeRatio)], ['leftFoot', bodyPoint(-half*.4,.045,height*.025)],
     ['rightUpperLeg', bodyPoint(half*.38,hipRatio-.015)], ['rightLowerLeg', bodyPoint(half*.4,kneeRatio)], ['rightFoot', bodyPoint(half*.4,.045,height*.025)],
   ];
@@ -816,7 +831,7 @@ async function createGeometricRig(forwardAxis = '+Z') {
   refreshBoneData();
   ensureGeneratedAnimations();
   crossFadeForPlan(currentPlan);
-  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, hands: { left: { inferred: hands.left.inferred, samples: hands.left.sampleCount || 0 }, right: { inferred: hands.right.inferred, samples: hands.right.sampleCount || 0 } }, confidence: 'low', warnings: ['Rig y clips base generados localmente sin Blender; proporciones y pesos son aproximados. La posición y orientación de dedos se infieren localmente de la nube de vértices de cada mano; revisa ambos lados.'] };
+  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, hands: { left: { inferred: hands.left.inferred, samples: hands.left.sampleCount || 0, pose: hands.left.pose }, right: { inferred: hands.right.inferred, samples: hands.right.sampleCount || 0, pose: hands.right.pose } }, confidence: 'low', warnings: ['Rig y clips base generados localmente sin Blender; proporciones y pesos son aproximados. La posición y orientación de dedos se infieren localmente de la nube de vértices de cada mano; revisa ambos lados.'] };
 }
 
 async function autoRig(forwardAxis = '+Z') {

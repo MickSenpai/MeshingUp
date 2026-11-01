@@ -47,4 +47,5 @@
 - Los dedos y el pulgar ahora se distribuyen dentro de esa orientación local y sus articulaciones siguen la dirección estimada de la mano. El rig guarda en el informe si la inferencia tuvo muestras en cada lado.
 - Se mantiene una advertencia explícita: la estimación puede fallar con manos ocultas, brazos cruzados, poses extremas o geometría estilizada y se debe revisar visualmente.
 - La inspección del GLB compartido encontró muestras distales en ambos lados; el cambio usa esos grupos para orientar el ajuste de cada mano.
+- La captura siguiente reveló que el detector anterior ubicaba hombros demasiado abajo y confundía vértices del torso con manos. Se añadió detección de brazos extendidos, una banda de muestreo alrededor de los hombros y articulaciones de brazo interpoladas entre hombro y muñeca.
 - `npm run build` en `viewer3d/`: completado. Vite conserva el aviso no bloqueante sobre el tamaño del bundle.
