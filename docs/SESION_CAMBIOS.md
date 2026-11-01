@@ -40,3 +40,11 @@
 - El auto-rig deduce anatomía y pesos desde la geometría; no recupera anatomía oculta y puede ubicar mal articulaciones en modelos estilizados.
 - Los ajustes actuales editan huesos y pivotes existentes. Aún no hay pintura manual de pesos ni herramientas para remodelar o cortar la malla.
 - La conexión de eventos de TTS/Meido en vivo sigue pendiente; las señales de voz han de venir de una integración externa.
+
+## 2026-11-01 — ajuste local de manos y dedos
+
+- Se reemplazaron las posiciones fijas de dedos por una estimación geométrica por mano: RigM busca vértices de la región distal del brazo, aproxima el centro de la mano y deduce dirección, ancho y longitud usando muestras locales.
+- Los dedos y el pulgar ahora se distribuyen dentro de esa orientación local y sus articulaciones siguen la dirección estimada de la mano. El rig guarda en el informe si la inferencia tuvo muestras en cada lado.
+- Se mantiene una advertencia explícita: la estimación puede fallar con manos ocultas, brazos cruzados, poses extremas o geometría estilizada y se debe revisar visualmente.
+- La inspección del GLB compartido encontró muestras distales en ambos lados; el cambio usa esos grupos para orientar el ajuste de cada mano.
+- `npm run build` en `viewer3d/`: completado. Vite conserva el aviso no bloqueante sobre el tamaño del bundle.

@@ -591,12 +591,18 @@ async function createGeometricRig(forwardAxis = '+Z') {
   const profileBins = 64;
   const profileSamples = Array.from({ length: profileBins }, () => []);
   const sampleStride = Math.max(1, Math.ceil(vertexCount / 100000));
+  const sampledPositions = new Float32Array(Math.ceil(vertexCount / sampleStride) * 3);
   const sampleVertex = new THREE.Vector3();
+  let pointSampleCount = 0;
   let sampled = 0;
   for (const mesh of meshes) {
     const positions = mesh.geometry.attributes.position;
     for (let i = 0; i < positions.count; i += sampleStride) {
       sampleVertex.fromBufferAttribute(positions, i).applyMatrix4(mesh.matrixWorld);
+      sampledPositions[pointSampleCount * 3] = sampleVertex.x;
+      sampledPositions[pointSampleCount * 3 + 1] = sampleVertex.y;
+      sampledPositions[pointSampleCount * 3 + 2] = sampleVertex.z;
+      pointSampleCount++;
       const ratio = (sampleVertex.y - bounds.min.y) / height;
       if (ratio >= 0 && ratio <= 1) {
         const bin = Math.min(profileBins - 1, Math.floor(ratio * profileBins));
@@ -645,30 +651,91 @@ async function createGeometricRig(forwardAxis = '+Z') {
   const elbowRatio = shoulderRatio - (shoulderRatio - hipRatio) * .58;
   const handRatio = hipRatio + (shoulderRatio - hipRatio) * .12;
   const kneeRatio = hipRatio * .52;
+  const worldShoulder = (sign) => avatarRoot.localToWorld(bodyPoint(sign * half * .45, shoulderRatio).clone());
+  const worldElbow = (sign) => avatarRoot.localToWorld(bodyPoint(sign * half * 1.55, elbowRatio).clone());
+  const forwardVector = new THREE.Vector3(forward[0], 0, forward[1]).normalize();
+  const sideVector = new THREE.Vector3(side[0], 0, side[1]).normalize();
+  const bodyCenterX = cx + side[0] * centerOffset, bodyCenterZ = cz + side[1] * centerOffset;
+  const inferHand = (sideName, sign) => {
+    const shoulder = worldShoulder(sign), elbow = worldElbow(sign);
+    const candidates = [];
+    const minY = bounds.min.y + height * Math.max(.08, hipRatio - .06);
+    const maxY = bounds.min.y + height * Math.min(shoulderRatio + .025, neckRatio - .045);
+    for (let i = 0; i < pointSampleCount; i++) {
+      const x = sampledPositions[i * 3], y = sampledPositions[i * 3 + 1], z = sampledPositions[i * 3 + 2];
+      if (y < minY || y > maxY) continue;
+      const lateral = ((x - bodyCenterX) * side[0] + (z - bodyCenterZ) * side[1]) * sign;
+      if (lateral < half * .58) continue;
+      const dx = x - shoulder.x, dy = y - shoulder.y, dz = z - shoulder.z;
+      candidates.push({ x, y, z, distance: dx * dx + dy * dy + dz * dz });
+    }
+    if (candidates.length < 12) return { position: bodyPoint(sign * half * 1.9, handRatio), direction: new THREE.Vector3(0, -1, 0), across: sideVector.clone().multiplyScalar(sign), length: height * .055, width: height * .035, inferred: false };
+    candidates.sort((a, b) => b.distance - a.distance);
+    const cutoff = candidates[Math.min(candidates.length - 1, Math.floor(candidates.length * .965))].distance;
+    const distal = candidates.filter((sample) => sample.distance >= cutoff);
+    const endpointWorld = distal.reduce((sum, sample) => sum.add(new THREE.Vector3(sample.x, sample.y, sample.z)), new THREE.Vector3()).multiplyScalar(1 / distal.length);
+    const direction = endpointWorld.clone().sub(elbow).normalize();
+    if (direction.lengthSq() < .5) direction.copy(endpointWorld).sub(shoulder).normalize();
+    const wristWorld = endpointWorld.clone().addScaledVector(direction, -height * .035);
+    const wrist = avatarRoot.worldToLocal(wristWorld.clone());
+    let across = new THREE.Vector3().crossVectors(forwardVector, direction).normalize();
+    if (across.lengthSq() < .5) across.copy(sideVector);
+    if (across.dot(sideVector) * sign < 0) across.negate();
+    const local = [];
+    for (let i = 0; i < pointSampleCount; i++) {
+      const point = new THREE.Vector3(sampledPositions[i * 3], sampledPositions[i * 3 + 1], sampledPositions[i * 3 + 2]);
+      const relative = point.sub(wristWorld);
+      if (relative.lengthSq() <= (height * .11) ** 2) local.push({ along: relative.dot(direction), across: relative.dot(across) });
+    }
+    const quantile = (values, q, fallback) => {
+      if (!values.length) return fallback;
+      values.sort((a, b) => a - b);
+      return values[Math.floor((values.length - 1) * q)];
+    };
+    const positiveAlong = local.map((sample) => sample.along).filter((value) => value >= 0 && value <= height * .12);
+    const acrossValues = local.map((sample) => sample.across);
+    const inferredLength = quantile(positiveAlong, .9, height * .055);
+    const inferredWidth = quantile(acrossValues, .95, height * .02) - quantile(acrossValues, .05, -height * .02);
+    return {
+      position: wrist,
+      direction,
+      across,
+      length: Math.max(height * .025, Math.min(height * .075, inferredLength)),
+      width: Math.max(height * .018, Math.min(height * .075, inferredWidth)),
+      inferred: true,
+      sampleCount: distal.length,
+      side: sideName,
+    };
+  };
+  const hands = { left: inferHand('left', -1), right: inferHand('right', 1) };
   const joints = [
     ['hips', bodyPoint(0,hipRatio)], ['spine', bodyPoint(0,spineRatio)], ['chest', bodyPoint(0,chestRatio)], ['neck', bodyPoint(0,neckRatio)], ['head', bodyPoint(0,headRatio)], ['jaw', bodyPoint(0,jawRatio,height*.035)],
-    ['leftShoulder', bodyPoint(-half*.45,shoulderRatio)], ['leftUpperArm', bodyPoint(-half,shoulderRatio-.025)], ['leftLowerArm', bodyPoint(-half*1.55,elbowRatio)], ['leftHand', bodyPoint(-half*1.9,handRatio)],
-    ['rightShoulder', bodyPoint(half*.45,shoulderRatio)], ['rightUpperArm', bodyPoint(half,shoulderRatio-.025)], ['rightLowerArm', bodyPoint(half*1.55,elbowRatio)], ['rightHand', bodyPoint(half*1.9,handRatio)],
+    ['leftShoulder', bodyPoint(-half*.45,shoulderRatio)], ['leftUpperArm', bodyPoint(-half,shoulderRatio-.025)], ['leftLowerArm', bodyPoint(-half*1.55,elbowRatio)], ['leftHand', hands.left.position],
+    ['rightShoulder', bodyPoint(half*.45,shoulderRatio)], ['rightUpperArm', bodyPoint(half,shoulderRatio-.025)], ['rightLowerArm', bodyPoint(half*1.55,elbowRatio)], ['rightHand', hands.right.position],
     ['leftUpperLeg', bodyPoint(-half*.38,hipRatio-.015)], ['leftLowerLeg', bodyPoint(-half*.4,kneeRatio)], ['leftFoot', bodyPoint(-half*.4,.045,height*.025)],
     ['rightUpperLeg', bodyPoint(half*.38,hipRatio-.015)], ['rightLowerLeg', bodyPoint(half*.4,kneeRatio)], ['rightFoot', bodyPoint(half*.4,.045,height*.025)],
   ];
   const parents = { spine:'hips', chest:'spine', neck:'chest', head:'neck', jaw:'head', leftShoulder:'chest', leftUpperArm:'leftShoulder', leftLowerArm:'leftUpperArm', leftHand:'leftLowerArm', rightShoulder:'chest', rightUpperArm:'rightShoulder', rightLowerArm:'rightUpperArm', rightHand:'rightLowerArm', leftUpperLeg:'hips', leftLowerLeg:'leftUpperLeg', leftFoot:'leftLowerLeg', rightUpperLeg:'hips', rightLowerLeg:'rightUpperLeg', rightFoot:'rightLowerLeg' };
   for (const [sideName, sign] of [['left', -1], ['right', 1]]) {
-    const palm = sign * half * 1.9;
-    for (const [finger, spread] of [['Index', -0.034], ['Middle', -0.012], ['Ring', 0.012], ['Little', 0.034]]) {
+    const hand = hands[sideName];
+    const wristWorld = avatarRoot.localToWorld(hand.position.clone());
+    const dir = hand.direction.clone();
+    const across = hand.across.clone();
+    const fingerLayout = [['Index', .24], ['Middle', .06], ['Ring', -.14], ['Little', -.34]];
+    for (const [finger, spread] of fingerLayout) {
       const prefix = sideName + finger;
-      const lateral = palm + sign * spread * height;
-      const base = bodyPoint(lateral, handRatio - 0.005, height * 0.008);
-      const middle = bodyPoint(lateral + sign * spread * height * 0.12, handRatio - 0.002, height * 0.035);
-      const tip = bodyPoint(lateral + sign * spread * height * 0.22, handRatio - 0.006, height * 0.062);
+      const offset = hand.width * spread;
+      const base = avatarRoot.worldToLocal(wristWorld.clone().addScaledVector(dir, hand.length * .12).addScaledVector(across, offset));
+      const middle = avatarRoot.worldToLocal(wristWorld.clone().addScaledVector(dir, hand.length * .56).addScaledVector(across, offset * 1.12));
+      const tip = avatarRoot.worldToLocal(wristWorld.clone().addScaledVector(dir, hand.length).addScaledVector(across, offset * 1.22));
       joints.push([prefix + 'Proximal', base], [prefix + 'Intermediate', middle], [prefix + 'Distal', tip]);
       parents[prefix + 'Proximal'] = sideName + 'Hand';
       parents[prefix + 'Intermediate'] = prefix + 'Proximal';
       parents[prefix + 'Distal'] = prefix + 'Intermediate';
     }
-    const thumbBase = bodyPoint(palm - sign * height * 0.025, handRatio + 0.012, height * 0.004);
-    const thumbMiddle = bodyPoint(palm - sign * height * 0.045, handRatio + 0.018, height * 0.025);
-    const thumbTip = bodyPoint(palm - sign * height * 0.06, handRatio + 0.014, height * 0.045);
+    const thumbBase = avatarRoot.worldToLocal(wristWorld.clone().addScaledVector(dir, hand.length * .08).addScaledVector(across, hand.width * .5));
+    const thumbMiddle = avatarRoot.worldToLocal(wristWorld.clone().addScaledVector(dir, hand.length * .25).addScaledVector(across, hand.width * .82));
+    const thumbTip = avatarRoot.worldToLocal(wristWorld.clone().addScaledVector(dir, hand.length * .42).addScaledVector(across, hand.width * .94));
     joints.push([sideName + 'ThumbProximal', thumbBase], [sideName + 'ThumbIntermediate', thumbMiddle], [sideName + 'ThumbDistal', thumbTip]);
     parents[sideName + 'ThumbProximal'] = sideName + 'Hand';
     parents[sideName + 'ThumbIntermediate'] = sideName + 'ThumbProximal';
@@ -749,7 +816,7 @@ async function createGeometricRig(forwardAxis = '+Z') {
   refreshBoneData();
   ensureGeneratedAnimations();
   crossFadeForPlan(currentPlan);
-  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, confidence: 'low', warnings: ['Rig y clips base generados localmente sin Blender; pivotes y pesos aproximados requieren una revisión visual rápida.'] };
+  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, hands: { left: { inferred: hands.left.inferred, samples: hands.left.sampleCount || 0 }, right: { inferred: hands.right.inferred, samples: hands.right.sampleCount || 0 } }, confidence: 'low', warnings: ['Rig y clips base generados localmente sin Blender; proporciones y pesos son aproximados. La posición y orientación de dedos se infieren localmente de la nube de vértices de cada mano; revisa ambos lados.'] };
 }
 
 async function autoRig(forwardAxis = '+Z') {
