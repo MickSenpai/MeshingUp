@@ -174,6 +174,11 @@ class Avatar3DDialog(QDialog):
         self.reset_bone_button.setEnabled(False)
         self.reset_bone_button.clicked.connect(self._reset_selected_bone)
         action_controls.addWidget(self.reset_bone_button)
+        self.reset_all_bones_button = QPushButton("Restaurar rig completo")
+        self.reset_all_bones_button.setToolTip("Deshace todos los giros y desplazamientos manuales de huesos.")
+        self.reset_all_bones_button.setEnabled(False)
+        self.reset_all_bones_button.clicked.connect(self._reset_all_bones)
+        action_controls.addWidget(self.reset_all_bones_button)
         self.save_edit_button = QPushButton("Guardar rig/pose editados")
         self.save_edit_button.setEnabled(False)
         self.save_edit_button.clicked.connect(self.save_edited_model)
@@ -344,11 +349,14 @@ class Avatar3DDialog(QDialog):
         for spin in self.position_spins:
             spin.setEnabled(enabled and info.get("format") == "glb")
         self.reset_bone_button.setEnabled(enabled)
+        self.reset_all_bones_button.setEnabled(enabled)
         self.save_edit_button.setEnabled(enabled and self.bridge is not None and info.get("format") == "glb")
         if enabled:
             self._select_bone(self.bone_combo.currentText())
         elif isinstance(info, dict) and info.get("loaded"):
             self.message.setText("El modelo cargó, pero no contiene huesos. Crea el auto-rig para inspeccionarlos y editarlos.")
+        if enabled:
+            self._run("window.rigmAvatar?.selectBone(" + json.dumps(self.bone_combo.currentText()) + ");")
 
     def _toggle_skeleton(self, visible: bool) -> None:
         self.skeleton_button.setText("Ocultar esqueleto" if visible else "Mostrar esqueleto")
@@ -357,6 +365,7 @@ class Avatar3DDialog(QDialog):
     def _select_bone(self, name: str) -> None:
         if not name:
             return
+        self._run("window.rigmAvatar?.selectBone(" + json.dumps(name) + ");")
         self._run("window.rigmAvatar?.getBoneRotation(" + json.dumps(name) + ")", self._receive_bone_rotation)
         self._run("window.rigmAvatar?.getBonePosition(" + json.dumps(name) + ")", self._receive_bone_position)
 
@@ -401,6 +410,16 @@ class Avatar3DDialog(QDialog):
                 spin.blockSignals(True)
                 spin.setValue(0)
                 spin.blockSignals(False)
+
+    def _reset_all_bones(self) -> None:
+        if not self.bone_combo.count():
+            return
+        self._run("window.rigmAvatar?.resetAllBones();")
+        for spin in (*self.bone_spins, *self.position_spins):
+            spin.blockSignals(True)
+            spin.setValue(0)
+            spin.blockSignals(False)
+        self.message.setText("Ajustes manuales deshechos. Guarda el GLB si quieres conservar el rig en su pose base.")
 
     def save_edited_model(self) -> None:
         if self.page_ready:

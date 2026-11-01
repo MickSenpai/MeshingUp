@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -234,6 +235,35 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
             destination.unlink()
         raise
     return {"project": str(project_file), "avatar": data["avatar3d"], "validation": info}
+
+
+def create_avatar_project(model_path: str | Path, project_path: str | Path, *, name: str | None = None, actor: str = "user") -> dict[str, Any]:
+    """Create a portable 3D-only RigM project from a GLB or VRM avatar."""
+    source = Path(model_path).expanduser().resolve()
+    if source.suffix.casefold() == ".vrm":
+        validation = validate_vrm(source)
+    elif source.suffix.casefold() == ".glb":
+        validation = validate_glb(source)
+    else:
+        raise ProjectError("El proyecto 3D necesita un archivo .glb o .vrm.")
+    if validation["errors"]:
+        raise ProjectError("El modelo 3D no pasó la validación: " + " ".join(validation["errors"]))
+
+    destination = Path(project_path).expanduser().resolve()
+    if destination.exists():
+        raise ProjectError(f"Ya existe un proyecto en {destination}; elige otro nombre para no sobrescribirlo.")
+    data: dict[str, Any] = {
+        "id": str(uuid.uuid4()),
+        "name": name or destination.stem,
+        "joints": [], "bones": [], "layers": [],
+        "stage": "avatar3d", "status": "needs_review", "progress": 0,
+    }
+    save_project(destination, data, action="avatar3d_project_created", actor=actor)
+    try:
+        return attach_avatar(destination, source, actor=actor)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 def validate_vrm(path: str | Path) -> dict[str, Any]:

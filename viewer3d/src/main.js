@@ -44,6 +44,8 @@ let sourceGltf = null;
 let autoRigBones = [];
 let hostBridge = null;
 let skeletonHelper = null;
+let selectedBoneMarker = null;
+let selectedBoneName = '';
 let skeletonVisible = true;
 let manualPoseMode = false;
 let operationBusy = false;
@@ -170,6 +172,18 @@ function refreshBoneData() {
     skeletonHelper.renderOrder = 10;
     scene.add(skeletonHelper);
   }
+  if (selectedBoneMarker) {
+    scene.remove(selectedBoneMarker);
+    selectedBoneMarker.geometry.dispose();
+    selectedBoneMarker.material.dispose();
+  }
+  selectedBoneMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.018, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffc857, depthTest: false, transparent: true, opacity: 0.95 }),
+  );
+  selectedBoneMarker.renderOrder = 11;
+  selectedBoneMarker.visible = false;
+  scene.add(selectedBoneMarker);
 }
 
 function findBone(name) {
@@ -197,6 +211,17 @@ function resetBone(name) {
   manualBonePositions.delete(name);
   const position = node && boneRestPositions.get(node);
   if (node && position) node.position.copy(position);
+}
+function resetAllBones() {
+  manualBoneRotations.clear();
+  manualBonePositions.clear();
+  manualPoseMode = true;
+  activeAction?.stop(); activeAction = null;
+  restoreRestPose();
+}
+function selectBone(name) {
+  selectedBoneName = String(name || '');
+  if (selectedBoneMarker) selectedBoneMarker.visible = Boolean(findBone(selectedBoneName));
 }
 function getBonePosition(name) { return manualBonePositions.get(name) || [0, 0, 0]; }
 function setBonePosition(name, offsets) {
@@ -230,6 +255,95 @@ function addBoneRotation(name, x = 0, y = 0, z = 0) {
 }
 
 let gltfAnimations = [];
+const GENERATED_ACTIONS = [
+  { action: 'idle', name: 'RigM · Idle', duration: 3.2 },
+  { action: 'listen', name: 'RigM · Listening', duration: 2.8 },
+  { action: 'think', name: 'RigM · Thinking', duration: 3.6 },
+  { action: 'talk', name: 'RigM · Speaking', duration: 2.4 },
+  { action: 'wait', name: 'RigM · Waiting', duration: 3.4 },
+  { action: 'pace', name: 'RigM · Walk cycle', duration: 1.2 },
+  { action: 'recover', name: 'RigM · Recover', duration: 2.6 },
+];
+
+function generatedBone(name) {
+  const humanName = VRMHumanBoneName[name];
+  return (humanName && vrm?.humanoid?.getNormalizedBoneNode(humanName)) || findBone(name);
+}
+
+function actionAngles(action, name, phase) {
+  const wave = Math.sin(phase), wave2 = Math.sin(phase * 2);
+  const angles = [0, 0, 0];
+  const set = (axis, value) => { angles[axis] = value; };
+  if (name === 'spine' || name === 'chest') set(0, Math.sin(phase) * 0.018);
+  if (name === 'head') set(0, Math.sin(phase * 0.5) * 0.018);
+  if (action === 'listen') {
+    if (name === 'head') set(0, Math.sin(phase * 0.5) * 0.045 + Math.pow(Math.max(0, wave2), 5) * 0.07);
+    if (name === 'chest') set(2, Math.sin(phase * 0.5) * 0.025);
+  } else if (action === 'think') {
+    if (name === 'head') { set(0, -0.035); set(2, Math.sin(phase * 0.5) * 0.065); }
+    if (name === 'rightUpperArm') { set(0, -0.12); set(2, 0.12); }
+    if (name === 'rightLowerArm') set(0, -0.16 + wave * 0.025);
+  } else if (action === 'talk') {
+    if (name === 'head') { set(0, wave2 * 0.035); set(1, wave * 0.025); }
+    if (name === 'jaw') set(0, 0.025 + Math.max(0, Math.sin(phase * 4)) * 0.13);
+    if (name === 'leftUpperArm') set(2, wave * 0.16);
+    if (name === 'leftLowerArm') set(0, -Math.max(0, wave) * 0.12);
+    if (name === 'rightUpperArm') set(2, -wave * 0.12);
+    if (name === 'rightLowerArm') set(0, Math.max(0, -wave) * 0.09);
+    if (name.endsWith('Proximal') && /Index|Middle|Ring|Little/.test(name)) set(0, Math.max(0, wave) * 0.06);
+  } else if (action === 'pace') {
+    if (name === 'leftUpperLeg') set(0, wave * 0.34);
+    if (name === 'rightUpperLeg') set(0, -wave * 0.34);
+    if (name === 'leftLowerLeg') set(0, Math.max(0, -wave2) * 0.48);
+    if (name === 'rightLowerLeg') set(0, Math.max(0, wave2) * 0.48);
+    if (name === 'leftUpperArm') set(0, -wave * 0.22);
+    if (name === 'rightUpperArm') set(0, wave * 0.22);
+    if (name === 'leftLowerArm' || name === 'rightLowerArm') set(0, -0.12 + Math.max(0, wave2) * 0.1);
+    if (name === 'hips') set(1, wave * 0.035);
+  } else if (action === 'recover') {
+    if (name === 'head') set(0, -0.05 + wave * 0.035);
+    if (name === 'spine') set(0, -0.025 + wave * 0.018);
+  }
+  return angles;
+}
+
+function createGeneratedClip({ action, name, duration }) {
+  const times = [];
+  const sampleCount = 36;
+  for (let index = 0; index <= sampleCount; index++) times.push(duration * index / sampleCount);
+  const tracks = [];
+  const tracked = new Set();
+  const bones = ['hips', 'spine', 'chest', 'neck', 'head', 'jaw', 'leftShoulder', 'rightShoulder', 'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm', 'leftUpperLeg', 'rightUpperLeg', 'leftLowerLeg', 'rightLowerLeg', 'leftFoot', 'rightFoot', 'leftToeBase', 'rightToeBase', 'leftIndexProximal', 'leftMiddleProximal', 'leftRingProximal', 'leftLittleProximal', 'rightIndexProximal', 'rightMiddleProximal', 'rightRingProximal', 'rightLittleProximal'];
+  for (const semanticName of bones) {
+    const bone = generatedBone(semanticName);
+    if (!bone || tracked.has(bone)) continue;
+    tracked.add(bone);
+    const rest = boneRestQuaternions.get(bone) || bone.quaternion;
+    const values = [];
+    for (let index = 0; index <= sampleCount; index++) {
+      const phase = (index / sampleCount) * Math.PI * 2;
+      const [x, y, z] = actionAngles(action, semanticName, phase);
+      const quaternion = rest.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(x, y, z, 'XYZ')));
+      values.push(quaternion.x, quaternion.y, quaternion.z, quaternion.w);
+    }
+    tracks.push(new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`, times, values));
+  }
+  return tracks.length ? new THREE.AnimationClip(name, duration, tracks) : null;
+}
+
+function ensureGeneratedAnimations() {
+  for (const definition of GENERATED_ACTIONS) {
+    const preferred = {
+      idle: ['idle', 'rest', 'stand', 'breath'], listen: ['listen', 'attent'],
+      think: ['think', 'process', 'ponder'], talk: ['talk', 'speak', 'explain'],
+      wait: ['wait'], pace: ['walk', 'pace', 'nerv'], recover: ['recover'],
+    }[definition.action] || [definition.action];
+    if (gltfAnimations.some((clip) => preferred.some((token) => clip.name.toLowerCase().includes(token)))) continue;
+    const clip = createGeneratedClip(definition);
+    if (clip) gltfAnimations.push(clip);
+  }
+}
+
 function chooseClip(plan) {
   if (!gltfAnimations.length) return null;
   const tokens = {
@@ -238,7 +352,11 @@ function chooseClip(plan) {
     wait: ['wait', 'idle', 'stand'], pace: ['walk', 'pace', 'nerv'], recover: ['recover', 'idle', 'stand'],
   }[plan.action] || [plan.action];
   if (plan.intent) tokens.unshift(plan.intent);
-  return gltfAnimations.find((clip) => tokens.some((token) => clip.name.toLowerCase().includes(token))) || null;
+  for (const token of tokens) {
+    const clip = gltfAnimations.find((item) => item.name.toLowerCase().includes(token));
+    if (clip) return clip;
+  }
+  return null;
 }
 
 function crossFadeForPlan(plan) {
@@ -276,12 +394,19 @@ function applyPlan(plan) {
   }
   setExpression('happy', currentPlan.expression === 'happy' ? 0.38 : 0);
   setExpression('sad', currentPlan.expression === 'sad' ? 0.28 : 0);
-  const visemeValues = VISEMES[currentPlan.viseme?.shape] || VISEMES.open;
-  const speaking = currentPlan.state === 'speaking' ? Math.max(0, Math.min(1, currentPlan.speech?.energy || 0)) : 0;
-  for (const name of ['aa', 'ih', 'ou', 'ee', 'oh']) {
-    setExpression(name, Math.max(visemeValues[name] || 0, name === 'aa' ? speaking * 0.6 : 0));
-  }
+  applySpeechPose();
   showStatus(avatarDisplayName, `${currentPlan.state} · acción ${currentPlan.action || 'idle'}${gltfAnimations.length ? ` · ${gltfAnimations.length} clips` : ' · movimiento procedural'}`);
+}
+
+function applySpeechPose() {
+  const speaking = currentPlan.state === 'speaking';
+  const shape = speaking ? (currentPlan.viseme?.shape || 'silence') : 'silence';
+  const visemeValues = VISEMES[shape] || {};
+  const energy = speaking ? Math.max(0, Math.min(1, currentPlan.speech?.energy || 0)) : 0;
+  for (const name of ['aa', 'ih', 'ou', 'ee', 'oh']) {
+    setExpression(name, Math.max(visemeValues[name] || 0, name === 'aa' ? energy * 0.65 : 0));
+  }
+  if (speaking) addBoneRotation('jaw', 0.03 + energy * 0.17, 0, 0);
 }
 
 function loadModel(url, displayName = '') {
@@ -340,6 +465,7 @@ function loadModel(url, displayName = '') {
       const height = Math.max(0.2, normalizedBounds.max.y - normalizedBounds.min.y);
       avatarRoot.position.y -= normalizedBounds.min.y;
       refreshBoneData();
+      ensureGeneratedAnimations();
       rootRestY = avatarRoot.position.y;
       controls.target.set(0, height * 0.53, 0);
       camera.position.set(0, height * 0.78, height * 2.35);
@@ -434,9 +560,15 @@ function animate(now) {
       blink = Math.max(0, Math.sin(Math.PI * (1 - blinkRemaining / 0.16)));
     }
     setExpression('blink', blink);
+    applySpeechPose();
     vrm?.update(dt);
   }
   controls.update();
+  if (selectedBoneMarker?.visible) {
+    const selectedBone = findBone(selectedBoneName);
+    if (selectedBone) selectedBone.getWorldPosition(selectedBoneMarker.position);
+    else selectedBoneMarker.visible = false;
+  }
   renderer.render(scene, camera);
 }
 requestAnimationFrame(animate);
@@ -521,6 +653,30 @@ async function createGeometricRig(forwardAxis = '+Z') {
     ['rightUpperLeg', bodyPoint(half*.38,hipRatio-.015)], ['rightLowerLeg', bodyPoint(half*.4,kneeRatio)], ['rightFoot', bodyPoint(half*.4,.045,height*.025)],
   ];
   const parents = { spine:'hips', chest:'spine', neck:'chest', head:'neck', jaw:'head', leftShoulder:'chest', leftUpperArm:'leftShoulder', leftLowerArm:'leftUpperArm', leftHand:'leftLowerArm', rightShoulder:'chest', rightUpperArm:'rightShoulder', rightLowerArm:'rightUpperArm', rightHand:'rightLowerArm', leftUpperLeg:'hips', leftLowerLeg:'leftUpperLeg', leftFoot:'leftLowerLeg', rightUpperLeg:'hips', rightLowerLeg:'rightUpperLeg', rightFoot:'rightLowerLeg' };
+  for (const [sideName, sign] of [['left', -1], ['right', 1]]) {
+    const palm = sign * half * 1.9;
+    for (const [finger, spread] of [['Index', -0.034], ['Middle', -0.012], ['Ring', 0.012], ['Little', 0.034]]) {
+      const prefix = sideName + finger;
+      const lateral = palm + sign * spread * height;
+      const base = bodyPoint(lateral, handRatio - 0.005, height * 0.008);
+      const middle = bodyPoint(lateral + sign * spread * height * 0.12, handRatio - 0.002, height * 0.035);
+      const tip = bodyPoint(lateral + sign * spread * height * 0.22, handRatio - 0.006, height * 0.062);
+      joints.push([prefix + 'Proximal', base], [prefix + 'Intermediate', middle], [prefix + 'Distal', tip]);
+      parents[prefix + 'Proximal'] = sideName + 'Hand';
+      parents[prefix + 'Intermediate'] = prefix + 'Proximal';
+      parents[prefix + 'Distal'] = prefix + 'Intermediate';
+    }
+    const thumbBase = bodyPoint(palm - sign * height * 0.025, handRatio + 0.012, height * 0.004);
+    const thumbMiddle = bodyPoint(palm - sign * height * 0.045, handRatio + 0.018, height * 0.025);
+    const thumbTip = bodyPoint(palm - sign * height * 0.06, handRatio + 0.014, height * 0.045);
+    joints.push([sideName + 'ThumbProximal', thumbBase], [sideName + 'ThumbIntermediate', thumbMiddle], [sideName + 'ThumbDistal', thumbTip]);
+    parents[sideName + 'ThumbProximal'] = sideName + 'Hand';
+    parents[sideName + 'ThumbIntermediate'] = sideName + 'ThumbProximal';
+    parents[sideName + 'ThumbDistal'] = sideName + 'ThumbIntermediate';
+    joints.push([sideName + 'ToeBase', bodyPoint(sign * half * 0.4, .035, height * .075)], [sideName + 'ToeEnd', bodyPoint(sign * half * 0.4, .03, height * .14)]);
+    parents[sideName + 'ToeBase'] = sideName + 'Foot';
+    parents[sideName + 'ToeEnd'] = sideName + 'ToeBase';
+  }
   const byName = new Map(joints.map(([name, pos]) => [name, { name, pos, bone: new THREE.Bone() }]));
   for (const [name, item] of byName) {
     item.bone.name = name;
@@ -591,7 +747,9 @@ async function createGeometricRig(forwardAxis = '+Z') {
   }
   avatarRoot.updateMatrixWorld(true);
   refreshBoneData();
-  return { bones: autoRigBones.length, meshes: meshes.length, forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, confidence: 'low', warnings: ['Pivotes estimados por secciones de la geometría; revisa articulaciones y pesos antes de animar.'] };
+  ensureGeneratedAnimations();
+  crossFadeForPlan(currentPlan);
+  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, confidence: 'low', warnings: ['Rig y clips base generados localmente sin Blender; pivotes y pesos aproximados requieren una revisión visual rápida.'] };
 }
 
 async function autoRig(forwardAxis = '+Z') {
@@ -628,6 +786,8 @@ window.rigmAvatar = {
   setSkeletonVisible(visible) { skeletonVisible = Boolean(visible); if (skeletonHelper) skeletonHelper.visible = skeletonVisible; },
   setBoneRotation,
   resetBone,
+  resetAllBones,
+  selectBone,
   getBoneRotation(name) { return (manualBoneRotations.get(name) || [0, 0, 0]).map((value) => THREE.MathUtils.radToDeg(value)); },
   getBonePosition,
   setBonePosition,

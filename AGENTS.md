@@ -8,7 +8,9 @@ RigM es una aplicación de escritorio para convertir ilustraciones en personajes
 - Biblioteca: registra proyectos, descubre `.rigm` en `~/RigM/Projects`, marca archivos e imágenes ausentes y muestra etapa/estado/progreso/conteo de capas.
 - `rigmctl`: CLI estructurada para crear, inspeccionar, validar y modificar proyectos, pivotes, huesos, capas, máscaras, sprites extraídos, reconstrucciones y estado del trabajo. Usa las mismas operaciones de `rigm.project` que la interfaz.
 - La biblioteca detecta cambios externos y el editor impide sobrescribirlos sin recargar.
-- Las máscaras se crean vacías y se pintan a mano o se importan desde PNG; SAM 2 local propone tres candidatos mediante puntos/cajas y requiere aceptación explícita. Instala `.[segmentation]` para PyTorch/Transformers y `.[inpaint]` para OpenCV. RigM puede extraer sprites RGBA, reconstruir la base y exportar una composición. Aún no hay relleno semántico, mallas/pesos, deformaciones, cara, expresiones, clips, exportadores ni coordinador de IA.
+- Las máscaras se crean vacías y se pintan a mano o se importan desde PNG; SAM 2 local propone tres candidatos mediante puntos/cajas y requiere aceptación explícita. Instala `.[segmentation]` para PyTorch/Transformers y `.[inpaint]` para OpenCV. RigM también ofrece mallas/pesos, deformaciones, expresiones, clips y exportadores.
+- El visor 3D integrado genera un rig humanoide geométrico y clips base en Three.js, sin Blender. Trata las proporciones y pesos como aproximados; conserva la fuente y solicita revisión visual. Las señales de visemas/TTS deben venir de una integración externa.
+- Los proyectos 3D-only pueden omitir `image` e `image_size`, pero deben incluir un avatar GLB/VRM válido. No hagas obligatoria la imagen 2D para abrir o editar ese avatar.
 - No declarar un proyecto como `ready` si la validación informa pendientes.
 
 ## Reglas de arquitectura
