@@ -5,10 +5,12 @@ Blender ships its own Python runtime.
 """
 
 import bpy
+import bmesh
 import json
 import math
 import sys
 from mathutils import Matrix, Vector
+from mathutils.kdtree import KDTree
 
 
 def fail(message):
@@ -173,6 +175,30 @@ shoulder_z = mins[2] + height * shoulder_ratio
 left_slice, right_slice = section(shoulder_ratio)
 shoulder_half = max(torso_width * 0.56, min(height * 0.34, max(abs(left_slice), abs(right_slice)) * 0.55))
 
+
+def body_depth_at(z):
+    """Median front/back position of the body around a requested height."""
+    band = height * 0.018
+    values = [
+        (point[forward_index] - center[forward_index]) * forward_sign
+        for point in points
+        if abs(point.z - z) <= band
+        and abs((point[side_index] - center[side_index]) * side_sign) <= torso_width * 0.72
+    ]
+    if len(values) < 8:
+        values = [
+            (point[forward_index] - center[forward_index]) * forward_sign
+            for point in points if abs(point.z - z) <= height * 0.04
+        ]
+    if not values:
+        return 0.0
+    values.sort()
+    return values[(len(values) - 1) // 2]
+
+
+def body_point(lateral, z, front_offset=0.0):
+    return point_at(lateral, body_depth_at(z) + front_offset, z)
+
 # Find each arm's outside silhouette in the shoulder band. Joints are placed
 # along these measured extents, rather than simply scaling all axes by height.
 arm_levels = [max(0.08, min(0.92, shoulder_ratio - 0.07 + index * 0.009)) for index in range(20)]
@@ -224,17 +250,21 @@ def find_arm_component_points(side_direction):
                 (point[side_index] - center[side_index]) * side_sign * side_direction
                 for point in component
             ]
-            lateral_center = sum(lateral) / len(lateral)
-            mean_z = sum(point.z for point in component) / len(component)
-            max_lateral = max(lateral)
-            if (
-                lateral_center < shoulder_half * 0.75
-                or max_lateral < shoulder_half * 1.1
-                or mean_z < shoulder_z - height * 0.10
-                or mean_z > neck_z + height * 0.32
-            ):
+            # Rank islands by geometry actually present at shoulder height.
+            # A hair island can be wide and lie beside the head, so whole-island
+            # averages alone incorrectly classify it as an arm.
+            arm_band = [
+                (point, value) for point, value in zip(component, lateral)
+                if shoulder_z - height * 0.12 <= point.z <= shoulder_z + height * 0.12
+                and value >= shoulder_half * 0.62
+            ]
+            if len(arm_band) < 24:
                 continue
-            score = len(component) * max(0.05, max_lateral - lateral_center)
+            band_lateral = [value for _point, value in arm_band]
+            band_span = max(band_lateral) - min(band_lateral)
+            if band_span < height * 0.07:
+                continue
+            score = len(arm_band) * band_span
             candidates.append((score, component))
     return max(candidates, key=lambda item: item[0])[1] if candidates else []
 
@@ -249,13 +279,21 @@ def infer_hand_finger_tracks(side_name, side_direction, component_points):
     """Estimate four finger centerlines from the detected arm/hand island."""
     if not component_points:
         return []
+    arm_region = [
+        point for point in component_points
+        if abs(point.z - shoulder_z) <= height * 0.16
+        and (point[side_index] - center[side_index]) * side_sign * side_direction >= shoulder_half * 0.62
+    ]
     lateral_all = [
         (point[side_index] - center[side_index]) * side_sign * side_direction
-        for point in component_points
+        for point in arm_region
     ]
+    if len(arm_region) < 24:
+        hand_finger_track_counts[side_name] = {"candidate_vertices": len(arm_region), "tracks": 0}
+        return []
     distal_floor = max(shoulder_half * 1.05, sorted(lateral_all)[int((len(lateral_all) - 1) * 0.68)])
     candidates = []
-    for point in component_points:
+    for point in arm_region:
         lateral = (point[side_index] - center[side_index]) * side_sign * side_direction
         if lateral < distal_floor:
             continue
@@ -305,39 +343,44 @@ def infer_hand_finger_tracks(side_name, side_direction, component_points):
     return tracks if len(tracks) == 4 else []
 
 
-pelvis = point_at(0, 0, hip_z)
-add_bone("hips", pelvis, point_at(0, 0, spine_z), None)
-add_bone("spine", point_at(0, 0, spine_z), point_at(0, 0, chest_z), "hips")
-add_bone("chest", point_at(0, 0, chest_z), point_at(0, 0, neck_z), "spine")
-add_bone("neck", point_at(0, 0, neck_z), point_at(0, 0, head_z), "chest")
-add_bone("head", point_at(0, 0, head_z), point_at(0, 0, top_z), "neck")
+pelvis = body_point(0, hip_z)
+add_bone("hips", pelvis, body_point(0, spine_z), None)
+add_bone("spine", body_point(0, spine_z), body_point(0, chest_z), "hips")
+add_bone("chest", body_point(0, chest_z), body_point(0, neck_z), "spine")
+add_bone("neck", body_point(0, neck_z), body_point(0, head_z), "chest")
+add_bone("head", body_point(0, head_z), body_point(0, top_z), "neck")
 
 for side_name, sign in (("left", 1), ("right", -1)):
-    shoulder = point_at(sign * shoulder_half, 0, shoulder_z)
+    shoulder = body_point(sign * shoulder_half, shoulder_z)
     outside, wrist_z = arm_extents[side_name]
     elbow_side = sign * (shoulder_half + (outside - shoulder_half) * 0.52)
     wrist_side = sign * (shoulder_half + (outside - shoulder_half) * 0.87)
     elbow_z = shoulder_z + (wrist_z - shoulder_z) * 0.52
     wrist_z2 = shoulder_z + (wrist_z - shoulder_z) * 0.88
-    elbow = point_at(elbow_side, 0, elbow_z)
-    wrist = point_at(wrist_side, 0, wrist_z2)
-    hand = point_at(sign * outside, 0, wrist_z)
+    elbow = body_point(elbow_side, elbow_z)
+    wrist = body_point(wrist_side, wrist_z2)
+    hand = body_point(sign * outside, wrist_z)
     arm_component = find_arm_component_points(sign)
     arm_component_sizes[side_name] = len(arm_component)
     if arm_component:
+        arm_region = [
+            point for point in arm_component
+            if abs(point.z - shoulder_z) <= height * 0.12
+            and (point[side_index] - center[side_index]) * side_sign * sign >= shoulder_half * 0.62
+        ]
         component_lateral = [
             (point[side_index] - center[side_index]) * side_sign * sign
-            for point in arm_component
+            for point in arm_region
         ]
         def component_landmark(fraction):
             lateral_target = sorted(component_lateral)[int((len(component_lateral) - 1) * fraction)]
             nearby = [
-                point for point, lateral in zip(arm_component, component_lateral)
+                point for point, lateral in zip(arm_region, component_lateral)
                 if abs(lateral - lateral_target) <= height * 0.018
             ]
             if len(nearby) < 6:
                 nearby = sorted(
-                    arm_component,
+                    arm_region,
                     key=lambda point: abs((point[side_index] - center[side_index]) * side_sign * sign - lateral_target),
                 )[:max(6, len(arm_component) // 100)]
             depths = sorted((point[forward_index] - center[forward_index]) * forward_sign for point in nearby)
@@ -353,7 +396,13 @@ for side_name, sign in (("left", 1), ("right", -1)):
         wrist_z = wrist.z
         wrist_side = sign * abs((wrist[side_index] - center[side_index]) * side_sign)
         wrist_z2 = wrist.z
-    add_bone(side_name + "Shoulder", point_at(sign * torso_width * 0.43, 0, chest_z), shoulder, "chest")
+        # Refit the elbow from the same measured chain. Previously only the
+        # wrist/hand were replaced, leaving the elbow aimed at the old
+        # silhouette estimate (which may have been influenced by hair).
+        elbow = shoulder.lerp(wrist, 0.52)
+        elbow_side = sign * abs((elbow[side_index] - center[side_index]) * side_sign)
+        elbow_z = elbow.z
+    add_bone(side_name + "Shoulder", body_point(sign * torso_width * 0.43, chest_z), shoulder, "chest")
     add_bone(side_name + "UpperArm", shoulder, elbow, side_name + "Shoulder")
     add_bone(side_name + "LowerArm", elbow, wrist, side_name + "UpperArm")
     add_bone(side_name + "Hand", wrist, hand, side_name + "LowerArm")
@@ -367,10 +416,10 @@ for side_name, sign in (("left", 1), ("right", -1)):
         for spread in (-0.025, -0.008, 0.010, 0.027):
             finger_front = palm_front + forward_sign * side_sign * spread * height
             finger_tracks.append((
-                point_at(palm_side, finger_front, wrist_z),
-                point_at(palm_side + sign * finger_length * 0.30, finger_front, wrist_z),
-                point_at(palm_side + sign * finger_length * 0.65, finger_front, wrist_z),
-                point_at(palm_side + sign * finger_length, finger_front, wrist_z),
+                body_point(palm_side, wrist_z, finger_front),
+                body_point(palm_side + sign * finger_length * 0.30, wrist_z, finger_front),
+                body_point(palm_side + sign * finger_length * 0.65, wrist_z, finger_front),
+                body_point(palm_side + sign * finger_length, wrist_z, finger_front),
             ))
     for finger_name, track in zip(("Index", "Middle", "Ring", "Little"), finger_tracks):
         base, knuckle, middle, tip = track
@@ -378,16 +427,16 @@ for side_name, sign in (("left", 1), ("right", -1)):
         add_bone(prefix + "Proximal", base, knuckle, side_name + "Hand")
         add_bone(prefix + "Intermediate", knuckle, middle, prefix + "Proximal")
         add_bone(prefix + "Distal", middle, tip, prefix + "Intermediate")
-    thumb_base = point_at(palm_side - sign * height * 0.008, palm_front - forward_sign * side_sign * height * 0.018, wrist_z + height * 0.004)
-    thumb_mid = point_at(palm_side + sign * height * 0.006, palm_front - forward_sign * side_sign * height * 0.034, wrist_z + height * 0.01)
-    thumb_tip = point_at(palm_side + sign * height * 0.022, palm_front - forward_sign * side_sign * height * 0.047, wrist_z + height * 0.016)
+    thumb_base = body_point(palm_side - sign * height * 0.008, wrist_z + height * 0.004, palm_front - forward_sign * side_sign * height * 0.018)
+    thumb_mid = body_point(palm_side + sign * height * 0.006, wrist_z + height * 0.01, palm_front - forward_sign * side_sign * height * 0.034)
+    thumb_tip = body_point(palm_side + sign * height * 0.022, wrist_z + height * 0.016, palm_front - forward_sign * side_sign * height * 0.047)
     add_bone(side_name + "ThumbMetacarpal", thumb_base, thumb_mid, side_name + "Hand")
     add_bone(side_name + "ThumbProximal", thumb_mid, thumb_tip, side_name + "ThumbMetacarpal")
-    add_bone(side_name + "ThumbDistal", thumb_tip, point_at(palm_side + sign * height * 0.032, palm_front - forward_sign * side_sign * height * 0.055, wrist_z + height * 0.02), side_name + "ThumbProximal")
-    hip = point_at(sign * hip_half, 0, hip_z)
-    knee = point_at(sign * knee_half, 0, zmin + height * 0.27)
-    ankle = point_at(sign * ankle_half, 0, zmin + height * 0.055)
-    toe = point_at(sign * ankle_half, -forward_sign * height * 0.12, zmin + height * 0.035)
+    add_bone(side_name + "ThumbDistal", thumb_tip, body_point(palm_side + sign * height * 0.032, wrist_z + height * 0.02, palm_front - forward_sign * side_sign * height * 0.055), side_name + "ThumbProximal")
+    hip = body_point(sign * hip_half, hip_z)
+    knee = body_point(sign * knee_half, zmin + height * 0.27)
+    ankle = body_point(sign * ankle_half, zmin + height * 0.055)
+    toe = body_point(sign * ankle_half, zmin + height * 0.035, height * 0.12)
     add_bone(side_name + "UpperLeg", hip, knee, "hips")
     add_bone(side_name + "LowerLeg", knee, ankle, side_name + "UpperLeg")
     add_bone(side_name + "Foot", ankle, toe, side_name + "LowerLeg")
@@ -416,57 +465,169 @@ for obj in meshes:
 arm_obj.select_set(True)
 bpy.context.view_layer.objects.active = arm_obj
 weights_method = "blender_automatic_weights"
+weight_proxy_stats = {
+    "attempted": False, "objects": 0, "vertices_before": 0, "vertices_after_weld": 0,
+    "proxy_weighted_vertices_before_repair": 0, "proxy_vertices_repaired": 0, "failure": None,
+}
+
+
+def try_welded_proxy_weights():
+    """Try heat weights on welded copies, then transfer them to source vertices."""
+    proxies = []
+    weight_proxy_stats["attempted"] = True
+    try:
+        for obj in meshes:
+            proxy_mesh = obj.data.copy()
+            proxy = bpy.data.objects.new(obj.name + "_RigM_WeightProxy", proxy_mesh)
+            bpy.context.collection.objects.link(proxy)
+            proxy.matrix_world = obj.matrix_world.copy()
+            bm = bmesh.new()
+            bm.from_mesh(proxy.data)
+            before = len(bm.verts)
+            bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+            weight_proxy_stats["vertices_before"] += before
+            weight_proxy_stats["vertices_after_weld"] += len(bm.verts)
+            bm.to_mesh(proxy.data)
+            bm.free()
+            proxies.append((obj, proxy))
+
+        bpy.ops.object.select_all(action="DESELECT")
+        for _source_obj, proxy in proxies:
+            proxy.select_set(True)
+        arm_obj.select_set(True)
+        bpy.context.view_layer.objects.active = arm_obj
+        bpy.ops.object.parent_set(type="ARMATURE_AUTO", keep_transform=True, xmirror=True)
+
+        for source_obj, proxy in proxies:
+            proxy_groups = {group.name: group for group in proxy.vertex_groups}
+            for name, _head, _tail, _parent in bones:
+                if name not in proxy_groups:
+                    proxy_groups[name] = proxy.vertex_groups.new(name=name)
+            proxy_group_names = {group.index: group.name for group in proxy.vertex_groups}
+            bone_segments = [(name, head, tail) for name, head, tail, _parent in bones]
+
+            def distance_to_segment(point, start, end):
+                direction = end - start
+                t = max(0.0, min(1.0, (point - start).dot(direction) / max(direction.length_squared, 1e-12)))
+                return (point - (start + direction * t)).length
+
+            weighted_count = 0
+            for vertex in proxy.data.vertices:
+                weights = [(item.group, item.weight) for item in vertex.groups if item.weight > 1e-10]
+                total = sum(weight for _index, weight in weights)
+                if total > 1e-10:
+                    weighted_count += 1
+                    for group_index, weight in weights:
+                        proxy.vertex_groups[group_index].add([vertex.index], weight / total, "REPLACE")
+                    continue
+                point = proxy.matrix_world @ vertex.co
+                nearest_name, _head, _tail = min(
+                    bone_segments,
+                    key=lambda segment: distance_to_segment(point, segment[1], segment[2]),
+                )
+                proxy_groups[nearest_name].add([vertex.index], 1.0, "REPLACE")
+                weight_proxy_stats["proxy_vertices_repaired"] += 1
+            weight_proxy_stats["proxy_weighted_vertices_before_repair"] += weighted_count
+            if weighted_count < max(1, int(len(proxy.data.vertices) * 0.10)):
+                raise RuntimeError(f"Los pesos por calor cubrieron menos del 10% del proxy {proxy.name}.")
+
+            tree = KDTree(len(proxy.data.vertices))
+            for vertex in proxy.data.vertices:
+                tree.insert(proxy.matrix_world @ vertex.co, vertex.index)
+            tree.balance()
+            for modifier in list(source_obj.modifiers):
+                if modifier.type == "ARMATURE" and modifier.object == arm_obj:
+                    source_obj.modifiers.remove(modifier)
+            for group in list(source_obj.vertex_groups):
+                source_obj.vertex_groups.remove(group)
+            target_groups = {name: source_obj.vertex_groups.new(name=name) for name in proxy_group_names.values()}
+            for vertex in source_obj.data.vertices:
+                world = source_obj.matrix_world @ vertex.co
+                _nearest, proxy_index, _distance = tree.find(world)
+                proxy_vertex = proxy.data.vertices[proxy_index]
+                weights = [(proxy_group_names[item.group], item.weight) for item in proxy_vertex.groups if item.weight > 1e-10]
+                total = sum(weight for _name, weight in weights)
+                if total <= 1e-10:
+                    raise RuntimeError(f"No se encontró peso proxy para {source_obj.name}:{vertex.index}.")
+                for name, weight in weights:
+                    target_groups[name].add([vertex.index], weight / total, "REPLACE")
+            source_obj.parent = arm_obj
+            modifier = source_obj.modifiers.new("RigM AutoRig", "ARMATURE")
+            modifier.object = arm_obj
+
+        weight_proxy_stats["objects"] = len(proxies)
+        return True
+    except Exception as exc:
+        weight_proxy_stats["failure"] = str(exc)
+        print("RIGM_AUTORIG_PROXY_WEIGHT_FALLBACK: " + str(exc), file=sys.stderr)
+        return False
+    finally:
+        for _source_obj, proxy in proxies:
+            mesh_data = proxy.data
+            bpy.data.objects.remove(proxy, do_unlink=True)
+            if mesh_data.users == 0:
+                bpy.data.meshes.remove(mesh_data)
+
+
 try:
     bpy.ops.object.parent_set(type="ARMATURE_AUTO", keep_transform=True, xmirror=True)
     has_armature_modifier = all(
         any(modifier.type == "ARMATURE" and modifier.object == arm_obj for modifier in obj.modifiers)
         for obj in meshes
     )
-    has_vertex_weights = all(
-        bool(obj.vertex_groups) and any(vertex.groups for vertex in obj.data.vertices)
+    has_complete_vertex_weights = all(
+        bool(obj.vertex_groups)
+        and all(
+            bool(vertex.groups)
+            and abs(sum(item.weight for item in vertex.groups) - 1.0) <= 1e-3
+            for vertex in obj.data.vertices
+        )
         for obj in meshes
     )
-    if not has_armature_modifier or not has_vertex_weights:
-        raise RuntimeError("Blender terminó el parenting automático sin crear un modifier y pesos utilizables.")
+    if not has_armature_modifier or not has_complete_vertex_weights:
+        raise RuntimeError("Blender no creó modifiers y pesos normalizados para todos los vértices.")
 except Exception as exc:
     print("RIGM_AUTORIG_WEIGHT_FALLBACK: " + str(exc), file=sys.stderr)
-    weights_method = "normalized_bone_segment_distance"
-    segments = [
-        {"name": name, "head": head.copy(), "tail": tail.copy(), "parent": parent}
-        for name, head, tail, parent in bones
-    ]
-    for segment_index, segment in enumerate(segments):
-        segment["neighbors"] = [
-            candidate_index for candidate_index, candidate in enumerate(segments)
-            if candidate_index == segment_index
-            or candidate["parent"] == segment["parent"]
-            or candidate["parent"] == segment["name"]
-            or segment["parent"] == candidate["name"]
+    if try_welded_proxy_weights():
+        weights_method = "blender_automatic_weights_welded_proxy"
+    else:
+        weights_method = "normalized_bone_segment_distance"
+        segments = [
+            {"name": name, "head": head.copy(), "tail": tail.copy(), "parent": parent}
+            for name, head, tail, parent in bones
         ]
-    for obj in meshes:
-        for group in list(obj.vertex_groups):
-            obj.vertex_groups.remove(group)
-        groups = {segment["name"]: obj.vertex_groups.new(name=segment["name"]) for segment in segments}
-        for vertex in obj.data.vertices:
-            world = obj.matrix_world @ vertex.co
-            distances = []
-            for segment in segments:
-                start, end = segment["head"], segment["tail"]
-                direction = end - start
-                t = max(0.0, min(1.0, (world - start).dot(direction) / max(direction.length_squared, 1e-12)))
-                distances.append((world - (start + direction * t)).length)
-            nearest = min(range(len(segments)), key=distances.__getitem__)
-            allowed = sorted(segments[nearest]["neighbors"], key=distances.__getitem__)[:4]
-            raw = [
-                (segments[index]["name"], math.exp(-((distances[index] / max(height * 0.09, 1e-5)) ** 2) * 2.0))
-                for index in allowed
+        for segment_index, segment in enumerate(segments):
+            segment["neighbors"] = [
+                candidate_index for candidate_index, candidate in enumerate(segments)
+                if candidate_index == segment_index
+                or candidate["parent"] == segment["parent"]
+                or candidate["parent"] == segment["name"]
+                or segment["parent"] == candidate["name"]
             ]
-            total = sum(weight for _name, weight in raw) or 1.0
-            for name, weight in raw:
-                groups[name].add([vertex.index], weight / total, "REPLACE")
-        if not any(mod.type == "ARMATURE" for mod in obj.modifiers):
-            modifier = obj.modifiers.new("RigM AutoRig", "ARMATURE")
-            modifier.object = arm_obj
+        for obj in meshes:
+            for group in list(obj.vertex_groups):
+                obj.vertex_groups.remove(group)
+            groups = {segment["name"]: obj.vertex_groups.new(name=segment["name"]) for segment in segments}
+            for vertex in obj.data.vertices:
+                world = obj.matrix_world @ vertex.co
+                distances = []
+                for segment in segments:
+                    start, end = segment["head"], segment["tail"]
+                    direction = end - start
+                    t = max(0.0, min(1.0, (world - start).dot(direction) / max(direction.length_squared, 1e-12)))
+                    distances.append((world - (start + direction * t)).length)
+                nearest = min(range(len(segments)), key=distances.__getitem__)
+                allowed = sorted(segments[nearest]["neighbors"], key=distances.__getitem__)[:4]
+                raw = [
+                    (segments[index]["name"], math.exp(-((distances[index] / max(height * 0.09, 1e-5)) ** 2) * 2.0))
+                    for index in allowed
+                ]
+                total = sum(weight for _name, weight in raw) or 1.0
+                for name, weight in raw:
+                    groups[name].add([vertex.index], weight / total, "REPLACE")
+            if not any(mod.type == "ARMATURE" for mod in obj.modifiers):
+                modifier = obj.modifiers.new("RigM AutoRig", "ARMATURE")
+                modifier.object = arm_obj
 
 
 def correct_head_and_arm_weights():
@@ -609,6 +770,53 @@ def correct_head_and_arm_weights():
 weight_constraints = correct_head_and_arm_weights()
 
 
+def ensure_complete_vertex_weights():
+    """Repair uncovered vertices and normalize every vertex group sum."""
+    segments = [(name, head, tail) for name, head, tail, _parent in bones]
+    total_vertices = 0
+    unweighted_before = 0
+    repaired = 0
+    normalized = 0
+
+    def segment_distance(point, start, end):
+        direction = end - start
+        t = max(0.0, min(1.0, (point - start).dot(direction) / max(direction.length_squared, 1e-12)))
+        return (point - (start + direction * t)).length
+
+    for obj in meshes:
+        groups = {group.name: group for group in obj.vertex_groups}
+        for name, _head, _tail in segments:
+            if name not in groups:
+                groups[name] = obj.vertex_groups.new(name=name)
+        for vertex in obj.data.vertices:
+            total_vertices += 1
+            existing = [(item.group, item.weight) for item in vertex.groups if item.weight > 1e-10]
+            total = sum(weight for _index, weight in existing)
+            if total <= 1e-10:
+                unweighted_before += 1
+                point = obj.matrix_world @ vertex.co
+                nearest = min(segments, key=lambda segment: segment_distance(point, segment[1], segment[2]))
+                groups[nearest[0]].add([vertex.index], 1.0, "REPLACE")
+                repaired += 1
+                continue
+            if abs(total - 1.0) > 1e-5 or len(existing) != len(vertex.groups):
+                for index, _weight in existing:
+                    obj.vertex_groups[index].add([vertex.index], next(weight for group_index, weight in existing if group_index == index) / total, "REPLACE")
+                normalized += 1
+    return {
+        "method": "complete_normalized_vertex_weights_v1",
+        "vertex_count": total_vertices,
+        "unweighted_vertex_count_before_repair": unweighted_before,
+        "unweighted_vertex_count_after_repair": 0,
+        "repaired_vertex_count": repaired,
+        "normalized_vertex_count": normalized,
+        "coverage_percent_after_repair": 100.0 if total_vertices else 0.0,
+    }
+
+
+weight_coverage = ensure_complete_vertex_weights()
+
+
 def evaluate_pose_stress():
     """Measure edge distortion in deterministic joint-limit poses."""
     bpy.context.view_layer.update()
@@ -704,28 +912,37 @@ report = {
     "hand_finger_track_detection": hand_finger_track_counts,
     "forward_axis": input_forward_axis,
     "normalized_forward_axis": "-Y",
-    "confidence": "medium" if shape_ok and weights_method == "blender_automatic_weights" and deformation_validation["passed"] else "low",
+    "confidence": "medium" if shape_ok and weights_method in {"blender_automatic_weights", "blender_automatic_weights_welded_proxy"} and deformation_validation["passed"] and weight_coverage["repaired_vertex_count"] == 0 else "low",
     "deformation_validation": deformation_validation,
     "weight_constraints": weight_constraints,
+    "weight_coverage": weight_coverage,
+    "weight_proxy": weight_proxy_stats,
     "height": round(height, 5),
     "mesh_count": len(meshes),
     "vertex_count": len(points),
     "bone_count": len(bones),
     "proportions": {"pelvis": round(hip_ratio, 4), "chest": round(chest_ratio, 4), "shoulders": round(shoulder_ratio, 4), "neck": round(neck_ratio, 4), "head_center": round(head_ratio, 4), "chibi_head_detected": chibi_head_detected},
     "landmark_height_ratios": {"pelvis": round(hip_ratio, 4), "chest": round(chest_ratio, 4), "neck": round(neck_ratio, 4), "head": round(head_ratio, 4), "knees": 0.27, "ankles": 0.055},
+    "landmark_depths": {"pelvis": round(body_depth_at(hip_z), 5), "chest": round(body_depth_at(chest_z), 5), "neck": round(body_depth_at(neck_z), 5), "head": round(body_depth_at(head_z), 5)},
     "warnings": [
         "El esqueleto se estimó desde la silueta y proporciones globales; revisa pivotes y pesos antes de animar.",
         "La inferencia presupone un humanoide erguido y una malla cerrada; ropa suelta, cabello y accesorios pueden sesgar las medidas.",
         "Las cadenas de dedos son una pose anatómica estándar aproximada; ajusta su orientación y pesos para que sigan la geometría de cada mano.",
     ],
 }
-if weights_method != "blender_automatic_weights":
+if weights_method == "normalized_bone_segment_distance":
     report["warnings"].append("Blender no logró los pesos automáticos por calor; se aplicaron pesos aproximados por distancia a los huesos.")
+elif weights_method == "blender_automatic_weights_welded_proxy":
+    report["warnings"].append("Los pesos por calor se calcularon en una copia soldada para unir vértices duplicados y se transfirieron a la malla original por posición.")
 if not shape_ok:
     report["warnings"].append("Las proporciones están fuera del rango humanoide heurístico; la confianza del auto-rig es baja.")
 if any(layout != "mesh_point_cloud" for layout in hand_finger_layout_by_side.values()):
     report["warnings"].append("No se pudo detectar una isla conectada por brazo para ajustar los dedos; se usó la disposición proporcional de respaldo.")
 report["warnings"].extend(deformation_validation["warnings"])
+if weight_coverage["repaired_vertex_count"]:
+    report["warnings"].append(
+        f"Se reasignaron los pesos de {weight_coverage['repaired_vertex_count']} vértices sin influencia a su hueso más cercano."
+    )
 with open(report_path, "w", encoding="utf-8") as report_file:
     json.dump(report, report_file, ensure_ascii=False, indent=2)
 print("RIGM_AUTORIG_COMPLETE: " + json.dumps(report, ensure_ascii=False))

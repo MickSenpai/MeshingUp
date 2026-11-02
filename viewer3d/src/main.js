@@ -373,6 +373,24 @@ function crossFadeForPlan(plan) {
   activeAction = next;
 }
 
+function playClipByName(name, loop = true) {
+  if (!mixer) return false;
+  const clip = gltfAnimations.find((item) => item.name === name);
+  if (!clip) return false;
+  manualPoseMode = false;
+  manualBoneRotations.clear();
+  manualBonePositions.clear();
+  restoreRestPose();
+  const next = mixer.clipAction(clip);
+  next.reset().setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce, loop ? Infinity : 1);
+  next.clampWhenFinished = !loop;
+  next.setEffectiveTimeScale(1).setEffectiveWeight(1).fadeIn(0.2).play();
+  if (activeAction && activeAction !== next) activeAction.crossFadeTo(next, 0.2, true);
+  activeAction = next;
+  showStatus(avatarDisplayName, `Reproduciendo clip · ${clip.name}`);
+  return { name: clip.name, duration: clip.duration, loop };
+}
+
 function applyPlan(plan) {
   const previousState = currentPlan.state;
   const previousAction = currentPlan.action;
@@ -803,7 +821,8 @@ async function createGeometricRig(forwardAxis = '+Z') {
     b: byName.get(childName).pos,
     parentName,
     childName,
-    index: [...byName.keys()].indexOf(childName),
+    // Skinning indices address the bone at the start of this segment.
+    index: [...byName.keys()].indexOf(parentName),
   }));
   for (const [segmentIndex, segment] of segments.entries()) {
     segment.neighborIndices = segments.flatMap((candidate, candidateIndex) =>
@@ -926,6 +945,7 @@ window.rigmAvatar = {
   autoRig(forwardAxis) { return autoRig(forwardAxis).catch((error) => { showStatus(avatarDisplayName, `Error de auto-rig: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
   saveEditedModel() { return saveEditedModel().catch((error) => { showStatus(avatarDisplayName, `Error al guardar: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
   setPlan: applyPlan,
+  playClip(name, options = {}) { return playClipByName(name, options.loop !== false); },
   setSkeletonVisible(visible) { skeletonVisible = Boolean(visible); if (skeletonHelper) skeletonHelper.visible = skeletonVisible; },
   setBoneRotation,
   resetBone,

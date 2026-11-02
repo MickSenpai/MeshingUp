@@ -128,6 +128,16 @@ class Avatar3DDialog(QDialog):
         self.state_combo.currentIndexChanged.connect(self._send_state)
         controls.addWidget(QLabel("Conducta"))
         controls.addWidget(self.state_combo)
+        clip_controls = QHBoxLayout()
+        clip_controls.addWidget(QLabel("Clip GLB"))
+        self.clip_combo = QComboBox()
+        self.clip_combo.setEnabled(False)
+        self.clip_combo.setMinimumWidth(150)
+        clip_controls.addWidget(self.clip_combo, 1)
+        self.play_clip_button = QPushButton("Reproducir clip")
+        self.play_clip_button.setEnabled(False)
+        self.play_clip_button.clicked.connect(self._play_selected_clip)
+        clip_controls.addWidget(self.play_clip_button)
         self.intensity_slider = QSlider(Qt.Orientation.Horizontal)
         self.intensity_slider.setRange(0, 100)
         self.intensity_slider.setValue(35)
@@ -202,6 +212,7 @@ class Avatar3DDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(self.web, 1)
         layout.addLayout(controls)
+        layout.addLayout(clip_controls)
         layout.addLayout(intensity_controls)
         layout.addLayout(action_controls)
         layout.addLayout(bone_controls)
@@ -280,6 +291,13 @@ class Avatar3DDialog(QDialog):
                 self.autorig_button.setText("Reintentar auto-rig")
             return
         self.model_ready = True
+        self.clip_combo.blockSignals(True)
+        self.clip_combo.clear()
+        self.clip_combo.addItems([str(name) for name in result.get("animations", []) if name])
+        self.clip_combo.blockSignals(False)
+        has_clips = self.clip_combo.count() > 0
+        self.clip_combo.setEnabled(has_clips)
+        self.play_clip_button.setEnabled(has_clips)
         self.message.setText(
             f"Modelo cargado · {result.get('meshes', 0)} mallas · "
             f"{len(result.get('bones', []))} huesos · {len(result.get('animations', []))} clips. "
@@ -289,6 +307,11 @@ class Avatar3DDialog(QDialog):
         self._receive_bones(result, 0)
         if self.autorig_requested:
             self._run("window.rigmAvatar?.autoRig(" + json.dumps(self.forward_axis) + ").catch(() => {});")
+
+    def _play_selected_clip(self) -> None:
+        name = self.clip_combo.currentText()
+        if name:
+            self._run("window.rigmAvatar?.playClip(" + json.dumps(name) + ", {loop: true});")
 
     def _on_progress(self, message: str) -> None:
         self.message.setText(str(message))

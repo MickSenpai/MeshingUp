@@ -4,6 +4,7 @@ import bpy
 import json
 import math
 import sys
+from mathutils import Euler
 
 
 def fail(message):
@@ -19,6 +20,11 @@ duration = int(request["duration"])
 fps = int(request["fps"])
 keyframes = request["keyframes"]
 
+scene = bpy.context.scene
+# Importer maps GLB keyframe seconds to frames using the scene rate. Set it
+# before import so old clips keep their real duration if fps changes.
+scene.render.fps = fps
+scene.render.fps_base = 1.0
 try:
     bpy.ops.import_scene.gltf(filepath=source_path)
 except Exception as exc:
@@ -33,12 +39,10 @@ unknown = sorted({key["bone"] for key in keyframes} - known_bones)
 if unknown:
     fail("El GLB no contiene estos huesos: " + ", ".join(unknown))
 
-scene = bpy.context.scene
-scene.render.fps = fps
 scene.frame_start = 0
-scene.frame_end = duration
 animation_data = armature.animation_data_create()
-old_action = animation_data.action
+preserved_actions = list(bpy.data.actions)
+preserved_frame_ends = [math.ceil(action.frame_range[1]) for action in preserved_actions if action.frame_range[1] > 0]
 muted_tracks = [(track, track.mute) for track in animation_data.nla_tracks]
 for track, _mute in muted_tracks:
     track.mute = True
@@ -48,19 +52,24 @@ if action.name != clip_name:
     fail(f"Ya existe una acción Blender llamada {action.name}; elige otro nombre para el clip.")
 animation_data.action = action
 for pose_bone in armature.pose.bones:
-    pose_bone.rotation_mode = "XYZ"
+    pose_bone.rotation_mode = "QUATERNION"
 
 for key in keyframes:
     frame = int(key["frame"])
     scene.frame_set(frame)
     pose_bone = armature.pose.bones[key["bone"]]
-    pose_bone.rotation_euler = tuple(math.radians(float(value)) for value in key["rotation"])
-    pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame, group=pose_bone.name)
+    # Input angles use normalized armature XYZ, not arbitrary bone-local axes.
+    rest_orientation = pose_bone.bone.matrix_local.to_quaternion()
+    semantic_delta = Euler(tuple(math.radians(float(value)) for value in key["rotation"]), "XYZ").to_quaternion()
+    local_delta = rest_orientation.inverted() @ semantic_delta @ rest_orientation
+    pose_bone.rotation_quaternion = local_delta
+    pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame, group=pose_bone.name)
 for curve in getattr(action, "fcurves", []):
     for point in curve.keyframe_points:
         point.interpolation = "BEZIER"
 
 # Restore existing animation tracks and make the new action active for export.
+scene.frame_end = max([duration, *preserved_frame_ends])
 animation_data.action = action
 for track, was_muted in muted_tracks:
     track.mute = was_muted
@@ -86,6 +95,9 @@ report = {
     "animation": clip_name,
     "duration_frames": duration,
     "fps": fps,
+    "duration_seconds": round(duration / fps, 6),
+    "preserved_action_frame_ends": preserved_frame_ends,
+    "rotation_space": "normalized_armature_xyz",
     "keyframe_count": len(keyframes),
     "animated_bones": sorted({key["bone"] for key in keyframes}),
     "interpolation": "BEZIER",

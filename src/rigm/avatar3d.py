@@ -457,7 +457,7 @@ def animate_avatar3d(
     actor: str = "agent",
     expected_mtime_ns: int | None = None,
 ) -> dict[str, Any]:
-    """Create an editable GLB action from structured local bone rotations."""
+    """Create an editable GLB action from structured semantic rig-axis rotations."""
     launcher = resolve_blender_launcher(blender_path)
     if not launcher:
         raise ProjectError("No encuentro Blender. Instálalo para generar animaciones GLB con `rigmctl avatar3d animate`.")
