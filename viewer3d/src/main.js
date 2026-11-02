@@ -590,6 +590,7 @@ async function createGeometricRig(forwardAxis = '+Z') {
   const width = Math.abs(side[0]) * (bounds.max.x - bounds.min.x) + Math.abs(side[1]) * (bounds.max.z - bounds.min.z);
   const profileBins = 64;
   const profileSamples = Array.from({ length: profileBins }, () => []);
+  const depthSamples = Array.from({ length: profileBins }, () => []);
   const sampleStride = Math.max(1, Math.ceil(vertexCount / 100000));
   const sampledPositions = new Float32Array(Math.ceil(vertexCount / sampleStride) * 3);
   const sampleVertex = new THREE.Vector3();
@@ -607,6 +608,7 @@ async function createGeometricRig(forwardAxis = '+Z') {
       if (ratio >= 0 && ratio <= 1) {
         const bin = Math.min(profileBins - 1, Math.floor(ratio * profileBins));
         profileSamples[bin].push(sampleVertex.x * side[0] + sampleVertex.z * side[1]);
+        depthSamples[bin].push(sampleVertex.x * forward[0] + sampleVertex.z * forward[1]);
       }
       sampled++;
       if (sampled % 10000 === 0) {
@@ -617,10 +619,17 @@ async function createGeometricRig(forwardAxis = '+Z') {
     }
   }
   const profile = profileSamples.map((values, index) => {
-    if (values.length < 8) return { y: (index + 0.5) / profileBins, width: 0, center: null };
+    if (values.length < 8) return { y: (index + 0.5) / profileBins, width: 0, center: null, depth: null };
     values.sort((a, b) => a - b);
     const quantile = (q) => values[Math.min(values.length - 1, Math.floor((values.length - 1) * q))];
-    return { y: (index + 0.5) / profileBins, width: quantile(.95) - quantile(.05), center: quantile(.5) };
+    const depths = depthSamples[index];
+    depths.sort((a, b) => a - b);
+    return {
+      y: (index + 0.5) / profileBins,
+      width: quantile(.95) - quantile(.05),
+      center: quantile(.5),
+      depth: depths[Math.floor((depths.length - 1) * .5)],
+    };
   });
   const headProfile = profile.filter((slice) => slice.width > 0 && slice.y >= .78 && slice.y <= .99);
   const headPeak = headProfile.reduce((best, slice) => !best || slice.width > best.width ? slice : best, null);
@@ -651,8 +660,30 @@ async function createGeometricRig(forwardAxis = '+Z') {
   const centerSlices = profile.filter((slice) => slice.center !== null && slice.y >= hipRatio && slice.y <= shoulderRatio + .02);
   const bodyCenter = centerSlices.length ? centerSlices.reduce((sum, slice) => sum + slice.center, 0) / centerSlices.length : cx * side[0] + cz * side[1];
   const centerOffset = bodyCenter - (cx * side[0] + cz * side[1]);
+  const depthCenter = (heightRatio) => {
+    const position = Math.max(0, Math.min(profileBins - 1, heightRatio * profileBins - .5));
+    const lower = Math.floor(position), upper = Math.min(profileBins - 1, lower + 1);
+    const valueAt = (index) => {
+      if (profile[index].depth !== null) return profile[index].depth;
+      for (let distance = 1; distance < profileBins; distance++) {
+        const before = profile[index - distance], after = profile[index + distance];
+        if (before?.depth !== null && before?.depth !== undefined) return before.depth;
+        if (after?.depth !== null && after?.depth !== undefined) return after.depth;
+      }
+      return cx * forward[0] + cz * forward[1];
+    };
+    const lowDepth = valueAt(lower), highDepth = valueAt(upper);
+    return THREE.MathUtils.lerp(lowDepth, highDepth, position - lower) - (cx * forward[0] + cz * forward[1]);
+  };
   const point = (x, y, z) => avatarRoot.worldToLocal(new THREE.Vector3(x, y, z));
-  const bodyPoint = (lateral, heightRatio, depth = 0) => point(cx + side[0] * (centerOffset + lateral) + forward[0] * depth, bounds.min.y + height * heightRatio, cz + side[1] * (centerOffset + lateral) + forward[1] * depth);
+  const bodyPoint = (lateral, heightRatio, depth = 0) => {
+    const sagittalDepth = depthCenter(heightRatio) + depth;
+    return point(
+      cx + side[0] * (centerOffset + lateral) + forward[0] * sagittalDepth,
+      bounds.min.y + height * heightRatio,
+      cz + side[1] * (centerOffset + lateral) + forward[1] * sagittalDepth,
+    );
+  };
   const half = Math.max(height * .065, Math.min((shoulderSlice?.width || width * .35) * .43, height * .18));
   const handRatio = hipRatio + (shoulderRatio - hipRatio) * .12;
   const kneeRatio = hipRatio * .52;
@@ -767,7 +798,24 @@ async function createGeometricRig(forwardAxis = '+Z') {
     item.bone.position.copy(parent ? item.pos.clone().sub(parent.pos) : item.pos);
   }
   avatarRoot.updateMatrixWorld(true);
-  const segments = Object.entries(parents).map(([child, parent]) => ({ a: byName.get(parent).pos, b: byName.get(child).pos, index: [...byName.keys()].indexOf(child) }));
+  const segments = Object.entries(parents).map(([childName, parentName]) => ({
+    a: byName.get(parentName).pos,
+    b: byName.get(childName).pos,
+    parentName,
+    childName,
+    index: [...byName.keys()].indexOf(childName),
+  }));
+  for (const [segmentIndex, segment] of segments.entries()) {
+    segment.neighborIndices = segments.flatMap((candidate, candidateIndex) =>
+      candidateIndex === segmentIndex
+      || candidate.parentName === segment.parentName
+      || candidate.parentName === segment.childName
+      || candidate.childName === segment.parentName
+      || candidate.childName === segment.childName
+        ? [candidateIndex]
+        : [],
+    );
+  }
   for (const segment of segments) {
     segment.dx = segment.b.x - segment.a.x;
     segment.dy = segment.b.y - segment.a.y;
@@ -783,28 +831,41 @@ async function createGeometricRig(forwardAxis = '+Z') {
     const indices = new Uint16Array(pos.count * 4), weights = new Float32Array(pos.count * 4);
     const meshToRoot = avatarRoot.matrixWorld.clone().invert().multiply(mesh.matrixWorld);
     const vertex = new THREE.Vector3();
-    const nearestIndex = new Int32Array(4), nearestDistance = new Float64Array(4);
+    const segmentDistances = new Float64Array(segments.length);
     const batchSize = 6000;
     for (let start = 0; start < pos.count; start += batchSize) {
       const end = Math.min(pos.count, start + batchSize);
       for (let i = start; i < end; i++) {
         vertex.fromBufferAttribute(pos, i).applyMatrix4(meshToRoot);
-        nearestIndex.fill(-1); nearestDistance.fill(Infinity);
-        for (const seg of segments) {
+        let nearestSegment = null, nearestSegmentDistance = Infinity;
+        for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+          const seg = segments[segmentIndex];
           const vx = vertex.x - seg.a.x, vy = vertex.y - seg.a.y, vz = vertex.z - seg.a.z;
           const t = Math.max(0, Math.min(1, (vx * seg.dx + vy * seg.dy + vz * seg.dz) / seg.lengthSq));
           const dx = vertex.x - (seg.a.x + t * seg.dx), dy = vertex.y - (seg.a.y + t * seg.dy), dz = vertex.z - (seg.a.z + t * seg.dz);
           const distance = dx * dx + dy * dy + dz * dz;
-          if (distance >= nearestDistance[3]) continue;
-          let at = 3;
-          while (at > 0 && distance < nearestDistance[at - 1]) {
-            nearestDistance[at] = nearestDistance[at - 1]; nearestIndex[at] = nearestIndex[at - 1]; at--;
+          segmentDistances[segmentIndex] = distance;
+          if (distance < nearestSegmentDistance) {
+            nearestSegmentDistance = distance;
+            nearestSegment = seg;
           }
-          nearestDistance[at] = distance; nearestIndex[at] = seg.index;
         }
+        const nearestSegments = [...nearestSegment.neighborIndices]
+          .sort((a, b) => segmentDistances[a] - segmentDistances[b])
+          .slice(0, 4);
         let total = 0;
-        for (let j = 0; j < 4; j++) total += 1 / Math.max(1e-7, nearestDistance[j]);
-        for (let j = 0; j < 4; j++) { indices[i * 4 + j] = nearestIndex[j]; weights[i * 4 + j] = (1 / Math.max(1e-7, nearestDistance[j])) / total; }
+        for (let j = 0; j < 4; j++) {
+          const segmentIndex = nearestSegments[j];
+          const distance = segmentIndex === undefined ? Infinity : segmentDistances[segmentIndex];
+          total += 1 / Math.max(1e-7, distance);
+        }
+        for (let j = 0; j < 4; j++) {
+          const segmentIndex = nearestSegments[j];
+          const segment = segmentIndex === undefined ? null : segments[segmentIndex];
+          const distance = segment ? segmentDistances[segmentIndex] : Infinity;
+          indices[i * 4 + j] = segment?.index ?? nearestSegment.index;
+          weights[i * 4 + j] = segment ? (1 / Math.max(1e-7, distance)) / total : 0;
+        }
       }
       completedVertices += end - start;
       if (completedVertices % (batchSize * 4) === 0 || completedVertices === vertexCount) {
@@ -831,7 +892,7 @@ async function createGeometricRig(forwardAxis = '+Z') {
   refreshBoneData();
   ensureGeneratedAnimations();
   crossFadeForPlan(currentPlan);
-  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, hands: { left: { inferred: hands.left.inferred, samples: hands.left.sampleCount || 0, pose: hands.left.pose }, right: { inferred: hands.right.inferred, samples: hands.right.sampleCount || 0, pose: hands.right.pose } }, confidence: 'low', warnings: ['Rig y clips base generados localmente sin Blender; proporciones y pesos son aproximados. La posición y orientación de dedos se infieren localmente de la nube de vértices de cada mano; revisa ambos lados.'] };
+  return { bones: autoRigBones.length, meshes: meshes.length, generated_animations: GENERATED_ACTIONS.map((item) => item.name).filter((name) => gltfAnimations.some((clip) => clip.name === name)), forward_axis: forwardAxis, proportions: { neck: neckRatio, shoulders: shoulderRatio, hips: hipRatio, chibi_head_detected: hasChibiHead }, hands: { left: { inferred: hands.left.inferred, samples: hands.left.sampleCount || 0, pose: hands.left.pose }, right: { inferred: hands.right.inferred, samples: hands.right.sampleCount || 0, pose: hands.right.pose } }, confidence: 'low', warnings: ['Las influencias se limitan a segmentos óseos conectados para reducir el arrastre entre regiones; las mallas fusionadas aún requieren revisión y corrección manual en articulaciones. La posición y orientación de dedos se infieren localmente de la nube de vértices de cada mano.'] };
 }
 
 async function autoRig(forwardAxis = '+Z') {

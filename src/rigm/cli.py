@@ -36,7 +36,7 @@ from .export import export_bundle
 from .rig import generate_layer_mesh, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .decomposition import decompose_project_with_see_through
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES, motion_event_from_agent
-from .avatar3d import attach_avatar, autorig_glb, validate_project_avatar, validate_glb, validate_vrm
+from .avatar3d import analyze_avatar_parts, animate_avatar3d, attach_avatar, autorig_glb, validate_project_avatar, validate_glb, validate_vrm
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -191,6 +191,17 @@ def _parser() -> argparse.ArgumentParser:
     avatar_autorig.add_argument("project")
     avatar_autorig.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
     avatar_autorig.add_argument("--forward-axis", choices=("-Y", "+Y", "-X", "+X"), default="-Y")
+    avatar_parts = avatar_sub.add_parser("analyze-parts", help="Detecta islas extraíbles y propone regiones corporales en un GLB usando Blender.")
+    avatar_parts.add_argument("project")
+    avatar_parts.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
+    avatar_parts.add_argument("--forward-axis", choices=("-Y", "+Y", "-X", "+X"), default="-Y")
+    avatar_animate = avatar_sub.add_parser("animate", help="Genera un clip GLB desde claves estructuradas de huesos usando Blender.")
+    avatar_animate.add_argument("project")
+    avatar_animate.add_argument("name")
+    avatar_animate.add_argument("--duration", type=int, required=True, help="Duración del clip en fotogramas.")
+    avatar_animate.add_argument("--fps", type=int, default=30)
+    avatar_animate.add_argument("--keyframe", nargs=5, action="append", required=True, metavar=("FRAME", "BONE", "RX", "RY", "RZ"), help="Clave de rotación local XYZ en grados; se puede repetir.")
+    avatar_animate.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, detecta PATH o Flatpak.")
     avatar_inspect = avatar_sub.add_parser("inspect", help="Muestra metadatos y capacidades del avatar registrado.")
     avatar_inspect.add_argument("project")
     avatar_validate = avatar_sub.add_parser("validate", help="Comprueba el avatar 3D y sus recursos.")
@@ -348,6 +359,22 @@ def main() -> None:
             _emit(result)
         elif args.command == "avatar3d" and args.avatar_action == "autorig":
             result = autorig_glb(args.project, blender_path=args.blender, forward_axis=args.forward_axis, actor="agent")
+            _emit(result)
+        elif args.command == "avatar3d" and args.avatar_action == "analyze-parts":
+            result = analyze_avatar_parts(args.project, blender_path=args.blender, forward_axis=args.forward_axis, actor="agent")
+            _emit(result)
+        elif args.command == "avatar3d" and args.avatar_action == "animate":
+            try:
+                keyframes = [
+                    {"frame": int(frame), "bone": bone, "rotation": [float(rx), float(ry), float(rz)]}
+                    for frame, bone, rx, ry, rz in args.keyframe
+                ]
+            except ValueError as exc:
+                raise ProjectError("Cada --keyframe requiere frame entero y tres rotaciones numéricas.") from exc
+            result = animate_avatar3d(
+                args.project, args.name, args.duration, args.fps, keyframes,
+                blender_path=args.blender, actor="agent",
+            )
             _emit(result)
         elif args.command == "avatar3d" and args.avatar_action in {"inspect", "validate"}:
             project_data = load_project(args.project)

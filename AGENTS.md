@@ -6,10 +6,11 @@ RigM es una aplicación de escritorio para convertir ilustraciones en personajes
 
 - Editor PyQt6: importa una imagen, coloca/mueve pivotes, conecta huesos, crea y pinta máscaras monocromas, abre y guarda `.rigm` portable.
 - Biblioteca: registra proyectos, descubre `.rigm` en `~/RigM/Projects`, marca archivos e imágenes ausentes y muestra etapa/estado/progreso/conteo de capas.
-- `rigmctl`: CLI estructurada para crear, inspeccionar, validar y modificar proyectos, pivotes, huesos, capas, máscaras, sprites extraídos, reconstrucciones y estado del trabajo. Usa las mismas operaciones de `rigm.project` que la interfaz.
+- `rigmctl`: CLI estructurada para crear, inspeccionar, validar y modificar proyectos, pivotes, huesos, capas, máscaras, sprites extraídos, reconstrucciones, clips 2D y animaciones GLB creadas con Blender. Usa operaciones compartidas con la interfaz y registra historial.
 - La biblioteca detecta cambios externos y el editor impide sobrescribirlos sin recargar.
 - Las máscaras se crean vacías y se pintan a mano o se importan desde PNG; SAM 2 local propone tres candidatos mediante puntos/cajas y requiere aceptación explícita. Instala `.[segmentation]` para PyTorch/Transformers y `.[inpaint]` para OpenCV. RigM también ofrece mallas/pesos, deformaciones, expresiones, clips y exportadores.
-- El visor 3D integrado genera un rig humanoide geométrico y clips base en Three.js, sin Blender. Trata las proporciones y pesos como aproximados; conserva la fuente y solicita revisión visual. Las señales de visemas/TTS deben venir de una integración externa.
+- El flujo 3D recomendado usa Blender para generar huesos y pesos automáticos; RigM abre su visor para probar clips base, editar pivotes y guardar GLB. Conserva la fuente y solicita revisión visual. El auto-rig geométrico Three.js sigue disponible como alternativa experimental sin Blender. Las señales de visemas/TTS deben venir de una integración externa.
+- `rigmctl avatar3d analyze-parts` y la interfaz pueden inventariar islas desconectadas y proponer regiones corporales/candidatos faciales con confianza explícita. No presentes propuestas heurísticas como separación semántica confirmada; conserva el hash fuente y solicita revisión antes de extraer.
 - Los proyectos 3D-only pueden omitir `image` e `image_size`, pero deben incluir un avatar GLB/VRM válido. No hagas obligatoria la imagen 2D para abrir o editar ese avatar.
 - No declarar un proyecto como `ready` si la validación informa pendientes.
 

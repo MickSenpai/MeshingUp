@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -172,6 +173,27 @@ def inspect_glb(path: str | Path) -> dict[str, Any]:
     }
 
 
+def resolve_blender_launcher(blender_path: str | None = None) -> list[str] | None:
+    """Find a native Blender executable or a user/system Flatpak launcher."""
+    if blender_path:
+        return [blender_path]
+    native = shutil.which("blender")
+    if native:
+        return [native]
+    flatpak = shutil.which("flatpak")
+    if flatpak:
+        for scope in ("--user", "--system"):
+            installed = subprocess.run([flatpak, "info", scope, "org.blender.Blender"], capture_output=True, check=False)
+            if installed.returncode == 0:
+                return [flatpak, "run", scope, "--command=blender", "org.blender.Blender"]
+    return None
+
+
+def blender_available() -> bool:
+    """Return whether Blender is available directly or as a user/system Flatpak."""
+    return resolve_blender_launcher() is not None
+
+
 def validate_glb(path: str | Path) -> dict[str, Any]:
     info = inspect_glb(path)
     errors: list[str] = []
@@ -189,7 +211,7 @@ def validate_glb(path: str | Path) -> dict[str, Any]:
     return {"valid": not errors, "errors": errors, "warnings": warnings, **info}
 
 
-def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: str = "user", extra_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: str = "user", extra_metadata: dict[str, Any] | None = None, action: str = "avatar3d_attached") -> dict[str, Any]:
     """Copy a VRM or GLB avatar into a project without altering the source."""
     source = Path(model_path).expanduser().resolve()
     suffix = source.suffix.casefold()
@@ -229,7 +251,7 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
     warning_summary = " ".join(info["warnings"])
     data["last_result"] = "Avatar 3D importado; requiere revisión." + (" " + warning_summary if warning_summary else "")
     try:
-        save_project(project_file, data, action="avatar3d_attached", actor=actor)
+        save_project(project_file, data, action=action, actor=actor)
     except Exception:
         if created_resource and destination.exists():
             destination.unlink()
@@ -298,29 +320,35 @@ def autorig_glb(project_path: str | Path, *, blender_path: str | None = None, fo
     """Generate an editable humanoid skeleton/weights for the project's unrigged GLB using Blender."""
     if forward_axis not in {"-Y", "+Y", "-X", "+X"}:
         raise ProjectError("El eje frontal debe ser -Y, +Y, -X o +X.")
-    executable = blender_path or shutil.which("blender")
-    if not executable:
+    launcher = resolve_blender_launcher(blender_path)
+    flatpak = shutil.which("flatpak")
+    if not launcher:
         raise ProjectError("No encuentro Blender. Instala Blender y vuelve a intentarlo, o indica su ejecutable con --blender.")
     project_file = Path(project_path).expanduser().resolve()
     data = load_project(project_file)
     avatar = data.get("avatar3d", {})
     if not isinstance(avatar, dict) or avatar.get("format") != "glb":
         raise ProjectError("Primero importa un archivo GLB al proyecto.")
-    if avatar.get("rigged"):
-        raise ProjectError("El GLB ya declara una skin. Abre el visor o importa una copia sin rig para crear otro esqueleto.")
-    source_relative = Path(str(avatar.get("path", "")))
+    is_rebuild = bool(avatar.get("rigged") and avatar.get("source_path"))
+    source_relative = Path(str(avatar.get("source_path") if is_rebuild else avatar.get("path", "")))
+    if source_relative.is_absolute() or ".." in source_relative.parts or not source_relative.parts:
+        raise ProjectError("La ruta del GLB fuente debe ser relativa y permanecer dentro del proyecto.")
     source = (project_file.parent / source_relative).resolve()
     try:
         source.relative_to(project_file.parent.resolve())
     except ValueError as exc:
         raise ProjectError("La ruta del GLB sale de la carpeta del proyecto.") from exc
-    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != avatar.get("sha256"):
+    expected_source_hash = avatar.get("source_sha256") if is_rebuild else avatar.get("sha256")
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected_source_hash:
         raise ProjectError("El GLB original falta o cambió desde que se importó; vuelve a importarlo antes de riggear.")
     script = Path(__file__).with_name("blender_autorig.py")
-    with tempfile.TemporaryDirectory(prefix="rigm-autorig-") as temporary_dir:
+    with tempfile.TemporaryDirectory(prefix=".rigm-autorig-", dir=project_file.parent) as temporary_dir:
         output = Path(temporary_dir) / "rigged.glb"
         report_file = Path(temporary_dir) / "analysis.json"
-        command = [str(executable), "--background", "--factory-startup", "--python-exit-code", "1", "--python", str(script), "--", str(source), str(output), str(report_file), forward_axis]
+        command = [*launcher]
+        if launcher[0] == flatpak:
+            command[3:3] = [f"--filesystem={project_file.parent}", f"--filesystem={script.parent}"]
+        command.extend(["--background", "--factory-startup", "--python-exit-code", "1", "--python", str(script), "--", str(source), str(output), str(report_file), forward_axis])
         try:
             process = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -340,14 +368,187 @@ def autorig_glb(project_path: str | Path, *, blender_path: str | None = None, fo
             raise ProjectError("El GLB resultante no contiene una skin utilizable: " + " ".join(result["errors"]))
         if expected_mtime_ns is not None and project_file.stat().st_mtime_ns != expected_mtime_ns:
             raise ProjectError("El proyecto cambió mientras Blender trabajaba. No guardé el auto-rig; recárgalo e inténtalo de nuevo.")
-        source_hash = avatar["sha256"]
+        source_hash = expected_source_hash
         source_path = source_relative.as_posix()
-        attached = attach_avatar(project_file, output, actor=actor, extra_metadata={
+        attached = attach_avatar(project_file, output, actor=actor, action="avatar3d_autorig_generated", extra_metadata={
             "name": avatar.get("name", source.stem),
             "source_path": source_path, "source_sha256": source_hash,
             "rigging": {"method": "blender_geometry_autorig", "forward_axis": forward_axis, **report},
         })
     return {**attached, "analysis": report}
+
+
+def analyze_avatar_parts(
+    project_path: str | Path,
+    *,
+    blender_path: str | None = None,
+    forward_axis: str = "-Y",
+    actor: str = "user",
+    expected_mtime_ns: int | None = None,
+) -> dict[str, Any]:
+    """Inventory extractable mesh islands and persist editable body-region proposals."""
+    if forward_axis not in {"-Y", "+Y", "-X", "+X"}:
+        raise ProjectError("El eje frontal debe ser -Y, +Y, -X o +X.")
+    launcher = resolve_blender_launcher(blender_path)
+    flatpak = shutil.which("flatpak")
+    if not launcher:
+        raise ProjectError("No encuentro Blender para analizar las piezas 3D.")
+    project_file = Path(project_path).expanduser().resolve()
+    data = load_project(project_file)
+    avatar = data.get("avatar3d", {})
+    if not isinstance(avatar, dict) or avatar.get("format") != "glb":
+        raise ProjectError("El análisis de piezas requiere un GLB importado al proyecto.")
+    source_relative = Path(str(avatar.get("source_path") if avatar.get("rigged") and avatar.get("source_path") else avatar.get("path", "")))
+    if source_relative.is_absolute() or ".." in source_relative.parts or not source_relative.parts:
+        raise ProjectError("La ruta GLB debe ser relativa y permanecer dentro del proyecto.")
+    source = (project_file.parent / source_relative).resolve()
+    try:
+        source.relative_to(project_file.parent.resolve())
+    except ValueError as exc:
+        raise ProjectError("La ruta del GLB sale de la carpeta del proyecto.") from exc
+    source_hash = avatar.get("source_sha256") if avatar.get("rigged") and avatar.get("source_path") else avatar.get("sha256")
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
+        raise ProjectError("El GLB fuente falta o cambió; vuelve a importarlo antes de analizar sus piezas.")
+    script = Path(__file__).with_name("blender_analyze_parts.py")
+    with tempfile.TemporaryDirectory(prefix=".rigm-parts-analysis-", dir=project_file.parent) as temporary_dir:
+        report_file = Path(temporary_dir) / "parts.json"
+        command = [*launcher]
+        if launcher[0] == flatpak:
+            command[3:3] = [f"--filesystem={project_file.parent}", f"--filesystem={script.parent}"]
+        command.extend([
+            "--background", "--factory-startup", "--python-exit-code", "1",
+            "--python", str(script), "--", str(source), str(report_file), forward_axis,
+        ])
+        try:
+            process = subprocess.run(command, capture_output=True, text=True, timeout=600, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProjectError(f"No pude ejecutar el análisis de piezas con Blender: {exc}") from exc
+        if process.returncode != 0 or not report_file.is_file():
+            detail = (process.stderr or process.stdout or "Blender terminó sin generar el informe.")[-3500:]
+            raise ProjectError("Falló el análisis de piezas. El GLB fuente sigue intacto. Detalle: " + detail)
+        try:
+            report = json.loads(report_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectError(f"Blender generó un informe de piezas ilegible: {exc}") from exc
+    if expected_mtime_ns is not None and project_file.stat().st_mtime_ns != expected_mtime_ns:
+        raise ProjectError("El proyecto cambió mientras Blender analizaba las piezas. Recárgalo e inténtalo de nuevo.")
+    report["source_file"] = source_relative.as_posix()
+    report["source_sha256"] = source_hash
+    data = load_project(project_file)
+    data.setdefault("avatar3d", {})["part_analysis"] = report
+    data["stage"] = "avatar3d_analysis"
+    data["status"] = "needs_review"
+    data["last_result"] = (
+        f"Análisis de piezas: {report.get('component_count', 0)} componentes; "
+        f"{report.get('extractable_component_count', 0)} candidatos geométricos extraíbles."
+    )
+    save_project(project_file, data, action="avatar3d_parts_analyzed", actor=actor)
+    return {"project": str(project_file), "analysis": report}
+
+
+def animate_avatar3d(
+    project_path: str | Path,
+    name: str,
+    duration: int,
+    fps: int,
+    keyframes: list[dict[str, Any]],
+    *,
+    blender_path: str | None = None,
+    actor: str = "agent",
+    expected_mtime_ns: int | None = None,
+) -> dict[str, Any]:
+    """Create an editable GLB action from structured local bone rotations."""
+    launcher = resolve_blender_launcher(blender_path)
+    if not launcher:
+        raise ProjectError("No encuentro Blender. Instálalo para generar animaciones GLB con `rigmctl avatar3d animate`.")
+    clip_name = str(name).strip()
+    if not clip_name or len(clip_name) > 80:
+        raise ProjectError("El nombre de la animación debe tener entre 1 y 80 caracteres.")
+    if not isinstance(duration, int) or duration < 2 or duration > 3600:
+        raise ProjectError("La duración debe estar entre 2 y 3600 fotogramas.")
+    if not isinstance(fps, int) or fps < 1 or fps > 120:
+        raise ProjectError("Los FPS deben estar entre 1 y 120.")
+    if not isinstance(keyframes, list) or not keyframes:
+        raise ProjectError("Añade al menos una clave con hueso, fotograma y rotación XYZ.")
+    normalized_keys = []
+    project_file = Path(project_path).expanduser().resolve()
+    starting_mtime_ns = project_file.stat().st_mtime_ns
+    if expected_mtime_ns is not None and starting_mtime_ns != expected_mtime_ns:
+        raise ProjectError("El proyecto cambió desde que se abrió; recárgalo antes de generar la animación.")
+    data = load_project(project_file)
+    info = data.get("avatar3d", {})
+    if not isinstance(info, dict) or info.get("format") != "glb" or not info.get("rigged"):
+        raise ProjectError("Primero crea un rig Blender en un GLB del proyecto.")
+    avatar_path = Path(str(info.get("path", "")))
+    if avatar_path.is_absolute() or ".." in avatar_path.parts or not avatar_path.parts:
+        raise ProjectError("La ruta del GLB debe permanecer dentro del proyecto.")
+    source = (project_file.parent / avatar_path).resolve()
+    try:
+        source.relative_to(project_file.parent.resolve())
+    except ValueError as exc:
+        raise ProjectError("La ruta del GLB sale de la carpeta del proyecto.") from exc
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != info.get("sha256"):
+        raise ProjectError("El GLB del avatar falta o cambió desde que se abrió el proyecto; recárgalo antes de animar.")
+    bone_names = set(inspect_glb(source)["human_bones"])
+    seen_keys: set[tuple[int, str]] = set()
+    for key in keyframes:
+        if not isinstance(key, dict):
+            raise ProjectError("Cada clave debe ser un objeto con frame, bone y rotation.")
+        frame, bone, rotation = key.get("frame"), str(key.get("bone", "")), key.get("rotation")
+        if not isinstance(frame, int) or frame < 0 or frame > duration:
+            raise ProjectError(f"El fotograma de {bone or 'una clave'} debe estar entre 0 y {duration}.")
+        if bone not in bone_names:
+            raise ProjectError(f"El GLB no contiene el hueso `{bone}`.")
+        identity = (frame, bone)
+        if identity in seen_keys:
+            raise ProjectError(f"Hay más de una clave para `{bone}` en el fotograma {frame}.")
+        seen_keys.add(identity)
+        if not isinstance(rotation, (list, tuple)) or len(rotation) != 3:
+            raise ProjectError(f"La rotación de `{bone}` debe contener tres ángulos XYZ en grados.")
+        try:
+            angles = [float(value) for value in rotation]
+        except (TypeError, ValueError) as exc:
+            raise ProjectError(f"La rotación de `{bone}` no es numérica.") from exc
+        if not all(math.isfinite(value) and abs(value) <= 3600 for value in angles):
+            raise ProjectError(f"Los ángulos de `{bone}` deben ser finitos y estar dentro de ±3600 grados.")
+        normalized_keys.append({"frame": frame, "bone": bone, "rotation": angles})
+    if clip_name in inspect_glb(source)["animations"]:
+        raise ProjectError(f"Ya existe una animación llamada `{clip_name}`. Elige otro nombre para conservar la anterior.")
+    script = Path(__file__).with_name("blender_animate.py")
+    with tempfile.TemporaryDirectory(prefix=".rigm-animation-", dir=project_file.parent) as temporary_dir:
+        temporary = Path(temporary_dir)
+        output, report_path, request_path = temporary / "animated.glb", temporary / "animation.json", temporary / "request.json"
+        request_path.write_text(json.dumps({"name": clip_name, "duration": duration, "fps": fps, "keyframes": normalized_keys}), encoding="utf-8")
+        command = [*launcher]
+        flatpak = shutil.which("flatpak")
+        if flatpak and launcher[0] == flatpak:
+            command[3:3] = [f"--filesystem={project_file.parent}", f"--filesystem={script.parent}"]
+        command.extend(["--background", "--factory-startup", "--python-exit-code", "1", "--python", str(script), "--", str(source), str(output), str(report_path), str(request_path)])
+        try:
+            process = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProjectError(f"No pude ejecutar la animación en Blender: {exc}") from exc
+        if process.returncode != 0 or not output.is_file() or not report_path.is_file():
+            detail = (process.stderr or process.stdout or "Blender terminó sin generar el GLB animado.")[-3500:]
+            raise ProjectError("Falló la generación de animación en Blender. La versión anterior sigue intacta. Detalle: " + detail)
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectError(f"Blender generó el modelo, pero no pude leer el informe de animación: {exc}") from exc
+        result = validate_glb(output)
+        if result["errors"] or clip_name not in result["animations"]:
+            raise ProjectError("El GLB exportado no contiene la animación solicitada: " + "; ".join(result["errors"]))
+        if project_file.stat().st_mtime_ns != starting_mtime_ns:
+            raise ProjectError("El proyecto cambió mientras Blender trabajaba. No guardé la animación; recárgalo e inténtalo de nuevo.")
+        rigging = dict(info.get("rigging", {}))
+        rigging["last_generated_animation"] = report
+        attached = attach_avatar(project_file, output, actor=actor, action="avatar3d_animation_generated", extra_metadata={
+            "name": info.get("name", source.stem),
+            "source_path": info.get("source_path", ""),
+            "source_sha256": info.get("source_sha256", ""),
+            "rigging": rigging,
+        })
+    return {**attached, "animation": report}
 
 
 def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> dict[str, Any] | None:
@@ -371,6 +572,19 @@ def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> d
     if avatar.get("sha256") != actual_hash:
         return {"errors": ["El hash del avatar VRM no coincide con el recurso registrado."], "warnings": []}
     result = validate_vrm(model) if avatar["format"] == "vrm" else validate_glb(model)
+    rigging = avatar.get("rigging", {})
+    deformation_validation = rigging.get("deformation_validation") if isinstance(rigging, dict) else None
+    validation_warnings: list[str] = []
+    if isinstance(deformation_validation, dict):
+        if not deformation_validation.get("passed", False):
+            validation_warnings.append("El rig no pasó la prueba automática de deformación; el proyecto requiere revisión y no debe marcarse como listo.")
+        validation_warnings.extend(
+            str(item) for item in deformation_validation.get("warnings", []) if isinstance(item, str)
+        )
+    part_analysis = avatar.get("part_analysis")
+    expected_analysis_hash = avatar.get("source_sha256") if avatar.get("source_path") else avatar.get("sha256")
+    if isinstance(part_analysis, dict) and part_analysis.get("source_sha256") != expected_analysis_hash:
+        validation_warnings.append("El análisis de piezas está obsoleto respecto al GLB fuente; vuelve a analizarlo.")
     source_relative = avatar.get("source_path")
     if source_relative:
         source = (root / str(source_relative)).resolve()
@@ -380,4 +594,7 @@ def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> d
             return {"errors": ["La ruta GLB de origen sale de la carpeta del proyecto."], "warnings": []}
         if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != avatar.get("source_sha256"):
             return {"errors": ["El GLB fuente del auto-rig falta o cambió."], "warnings": []}
-    return {"errors": result["errors"], "warnings": result["warnings"], "avatar": result}
+    return {
+        "errors": result["errors"], "warnings": [*result["warnings"], *validation_warnings],
+        "avatar": result, "deformation_validation": deformation_validation, "part_analysis": part_analysis,
+    }

@@ -49,7 +49,7 @@ from .project import (
 )
 from .rig import generate_layer_mesh, posed_joint_positions, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES
-from .avatar3d import attach_avatar, autorig_glb, create_avatar_project, validate_project_avatar
+from .avatar3d import analyze_avatar_parts, attach_avatar, autorig_glb, blender_available, create_avatar_project, validate_project_avatar
 from .avatar3d_viewer import Avatar3DDialog
 from .export import export_bundle
 from .decomposition import decompose_project_with_see_through
@@ -124,6 +124,28 @@ class AvatarAutoRigWorker(QThread):
     def run(self) -> None:
         try:
             result = autorig_glb(self.project_path, blender_path=self.blender_path, forward_axis=self.forward_axis, actor="user", expected_mtime_ns=self.expected_mtime_ns)
+        except (OSError, ProjectError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
+class AvatarPartsAnalysisWorker(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, project_path: Path, forward_axis: str, expected_mtime_ns: int | None = None):
+        super().__init__()
+        self.project_path = project_path
+        self.forward_axis = forward_axis
+        self.expected_mtime_ns = expected_mtime_ns
+
+    def run(self) -> None:
+        try:
+            result = analyze_avatar_parts(
+                self.project_path, forward_axis=self.forward_axis, actor="user",
+                expected_mtime_ns=self.expected_mtime_ns,
+            )
         except (OSError, ProjectError) as exc:
             self.failed.emit(str(exc))
         else:
@@ -578,6 +600,8 @@ class MainWindow(QMainWindow):
         self.behavior_clock = QElapsedTimer()
         self.behavior_last_elapsed_ms = 0
         self.autorig_worker: AvatarAutoRigWorker | None = None
+        self.avatar_parts_worker: AvatarPartsAnalysisWorker | None = None
+        self.blender_available = blender_available()
         self.library = library or ProjectLibrary()
         self.canvas = RigCanvas()
         self.canvas.joint_added.connect(self._add_joint_row)
@@ -904,24 +928,38 @@ class MainWindow(QMainWindow):
         avatar_layout = QVBoxLayout(avatar_panel)
         avatar_layout.addWidget(QLabel("AVATAR 3D · GLB / VRM"))
         avatar_intro = QLabel(
-            "Puedes importar un GLB con o sin esqueleto. RigM propone un esqueleto y pesos desde la geometría "
-            "sin Blender; revisa el resultado porque la inferencia es aproximada."
+            "Puedes importar un GLB con o sin esqueleto. El flujo recomendado usa Blender para auto-pesos; "
+            "después, RigM abre el visor para probar movimientos y guardar clips en el GLB."
         )
         avatar_intro.setWordWrap(True)
         avatar_layout.addWidget(avatar_intro)
         avatar_layout.addWidget(self.avatar3d_section_label)
         avatar_layout.addWidget(self.avatar3d_attach_button)
+        self.avatar3d_parts_button = QPushButton("Analizar piezas extraíbles")
+        self.avatar3d_parts_button.setEnabled(False)
+        self.avatar3d_parts_button.setToolTip("Inventaría piezas desconectadas y propone regiones corporales sin modificar el GLB fuente.")
+        self.avatar3d_parts_button.clicked.connect(self._analyze_avatar3d_parts)
+        avatar_layout.addWidget(self.avatar3d_parts_button)
         avatar_layout.addWidget(QLabel("Frente del personaje (para el análisis)"))
         self.autorig_forward_combo = QComboBox()
         for axis, label in (("+Z", "+Z · GLB habitual"), ("-Z", "−Z"), ("+X", "+X"), ("-X", "−X")):
             self.autorig_forward_combo.addItem(label, axis)
         self.autorig_forward_combo.setToolTip("Dirección frontal del modelo glTF. El auto-rig geométrico actual infiere una pose humanoide erguida.")
         avatar_layout.addWidget(self.autorig_forward_combo)
-        self.avatar3d_autorig_button = QPushButton("Analizar modelo y crear esqueleto")
+        self.avatar3d_autorig_button = QPushButton("Auto-rig geométrico en visor · experimental")
         self.avatar3d_autorig_button.setEnabled(False)
-        self.avatar3d_autorig_button.setToolTip("Propone huesos y pesos geométricos dentro del visor 3D. Conserva el GLB fuente.")
+        self.avatar3d_autorig_button.setToolTip("Usa la inferencia heurística de Three.js. Para mejores pesos, prueba el auto-rig de Blender.")
         self.avatar3d_autorig_button.clicked.connect(self._auto_rig_avatar3d)
         avatar_layout.addWidget(self.avatar3d_autorig_button)
+        self.avatar3d_blender_button = QPushButton("Crear rig con Blender")
+        self.avatar3d_blender_button.setEnabled(self.blender_available)
+        self.avatar3d_blender_button.setToolTip(
+            "Usa los pesos automáticos de Blender, respeta la dirección frontal seleccionada y puede rehacer el rig desde el GLB fuente."
+        )
+        if not self.blender_available:
+            self.avatar3d_blender_button.setToolTip("Instala Blender o `org.blender.Blender` desde Flatpak para habilitar el auto-rig.")
+        self.avatar3d_blender_button.clicked.connect(self._auto_rig_avatar3d_blender)
+        avatar_layout.addWidget(self.avatar3d_blender_button)
         self.avatar3d_rebuild_button = QPushButton("Rehacer esqueleto desde fuente")
         self.avatar3d_rebuild_button.setEnabled(False)
         self.avatar3d_rebuild_button.setToolTip("Vuelve al GLB original conservado en el proyecto y genera un rig nuevo.")
@@ -1122,8 +1160,18 @@ class MainWindow(QMainWindow):
         if not isinstance(avatar, dict):
             avatar = {}
         self.avatar3d_viewer_button.setEnabled(bool(avatar))
+        self.avatar3d_parts_button.setEnabled(bool(
+            self.blender_available and avatar.get("format") == "glb"
+        ))
         self.avatar3d_autorig_button.setEnabled(bool(avatar and avatar.get("format") == "glb" and not avatar.get("rigged")))
         source_model = avatar.get("source_path")
+        source_model_exists = bool(source_model and (self.project_path.parent / source_model).is_file())
+        can_blender_rig = bool(
+            self.blender_available and avatar.get("format") == "glb"
+            and (not avatar.get("rigged") or source_model_exists)
+        )
+        self.avatar3d_blender_button.setEnabled(can_blender_rig)
+        self.avatar3d_blender_button.setText("Rehacer rig con Blender" if avatar.get("rigged") else "Crear rig con Blender")
         self.avatar3d_rebuild_button.setEnabled(bool(
             avatar.get("format") == "glb" and avatar.get("rigged") and source_model
             and (self.project_path.parent / source_model).is_file()
@@ -1134,6 +1182,19 @@ class MainWindow(QMainWindow):
             else "Avatar VRM con esqueleto humanoide." if avatar.get("format") == "vrm"
             else "Importa un GLB o VRM. RigM puede proponer huesos para un GLB sin esqueleto."
         )
+        rigging = avatar.get("rigging", {})
+        deformation = rigging.get("deformation_validation") if isinstance(rigging, dict) else None
+        if isinstance(deformation, dict):
+            if deformation.get("passed"):
+                self.avatar3d_info.setText(
+                    f"Prueba automática de deformación: aprobada ({deformation.get('pose_count', 0)} poses). "
+                    "Aun así, revisa visualmente el movimiento."
+                )
+            else:
+                self.avatar3d_info.setText(
+                    f"Prueba automática de deformación: falló en {deformation.get('failed_pose_count', 0)} "
+                    f"de {deformation.get('pose_count', 0)} poses. Revisa pesos y articulaciones antes de animar."
+                )
         if not has_2d_source:
             self.avatar3d_info.setText(
                 "Proyecto 3D sin imagen 2D. El visor, el auto-rig y las animaciones 3D están disponibles; "
@@ -1202,18 +1263,50 @@ class MainWindow(QMainWindow):
         if dialog and dialog.allow_autorig:
             dialog.request_autorig()
 
-    def _choose_blender_binary(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Seleccionar ejecutable de Blender", "", "Todos los archivos (*)")
-        if path:
-            self.blender_path_edit.setText(path)
+    def _auto_rig_avatar3d_blender(self) -> None:
+        if self.project_path is None:
+            return
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", "El proyecto cambió desde que lo abriste. Recárgalo antes de riggear con Blender.")
+            self.reload_button.setEnabled(True)
+            return
+        avatar = load_project(self.project_path).get("avatar3d", {})
+        if avatar.get("format") != "glb" or (avatar.get("rigged") and not avatar.get("source_path")):
+            QMessageBox.information(self, "Auto-rig con Blender", "Importa un GLB sin rig o conserva el GLB fuente en el proyecto para rehacerlo.")
+            return
+        if self.autorig_worker is not None:
+            return
+        self.avatar3d_blender_button.setEnabled(False)
+        self.status.setText("Blender está preparando el esqueleto y calculando pesos…")
+        worker = AvatarAutoRigWorker(
+            self.project_path,
+            {"+Z": "-Y", "-Z": "+Y", "+X": "+X", "-X": "-X"}.get(self.autorig_forward_combo.currentData(), "-Y"),
+            expected_mtime_ns=self.loaded_mtime_ns,
+        )
+        self.autorig_worker = worker
+        worker.succeeded.connect(self._avatar_autorig_succeeded)
+        worker.failed.connect(self._avatar_autorig_failed)
+        worker.finished.connect(self._avatar_autorig_finished)
+        worker.start()
 
     def _avatar_autorig_succeeded(self, result: dict[str, Any]) -> None:
         self._open_project_file(self.project_path)
         self.refresh_library()
         analysis = result.get("analysis", {})
         confidence = analysis.get("confidence", "low")
-        self.avatar3d_info.setText(f"Esqueleto creado · confianza geométrica {confidence}. Revisa huesos y pesos en Blender antes de animar.")
-        self.status.setText("Auto-rig 3D guardado. Se conservó el GLB original y el nuevo rig quedó dentro del proyecto.")
+        deformation = analysis.get("deformation_validation", {})
+        if deformation and not deformation.get("passed", False):
+            self.avatar3d_info.setText(
+                f"Rig creado · prueba de deformación falló en {deformation.get('failed_pose_count', 0)} "
+                f"de {deformation.get('pose_count', 0)} poses. Revisa el informe antes de animar."
+            )
+        else:
+            self.avatar3d_info.setText(
+                f"Rig creado con Blender · confianza {confidence}. Prueba de deformación aprobada; "
+                "revisa visualmente las poses."
+            )
+        self.status.setText("Auto-rig de Blender guardado. Revisa las poses y pulsa «Guardar rig/pose editados» para incluir los clips base en el GLB.")
+        self._open_avatar3d_viewer()
         if analysis.get("warnings"):
             QMessageBox.information(self, "Revisa el auto-rig", "\n".join(analysis["warnings"]))
 
@@ -1221,11 +1314,86 @@ class MainWindow(QMainWindow):
         self.avatar3d_attach_button.setEnabled(True)
         self.avatar3d_viewer_button.setEnabled(True)
         self.avatar3d_autorig_button.setEnabled(True)
+        self.avatar3d_blender_button.setEnabled(self.blender_available)
         self.avatar3d_info.setText(message)
         QMessageBox.warning(self, "No pude crear el esqueleto", message)
 
     def _avatar_autorig_finished(self) -> None:
         self.autorig_worker = None
+
+    def _analyze_avatar3d_parts(self) -> None:
+        if self.project_path is None:
+            return
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", "El proyecto cambió desde que lo abriste. Recárgalo antes de analizar las piezas.")
+            self.reload_button.setEnabled(True)
+            return
+        if self.autorig_worker is not None or self.avatar_parts_worker is not None:
+            return
+        self.avatar3d_parts_button.setEnabled(False)
+        self.avatar3d_blender_button.setEnabled(False)
+        self.status.setText("Blender está analizando las piezas y regiones corporales…")
+        worker = AvatarPartsAnalysisWorker(
+            self.project_path,
+            {"+Z": "-Y", "-Z": "+Y", "+X": "+X", "-X": "-X"}.get(self.autorig_forward_combo.currentData(), "-Y"),
+            expected_mtime_ns=self.loaded_mtime_ns,
+        )
+        self.avatar_parts_worker = worker
+        worker.succeeded.connect(self._avatar_parts_analysis_succeeded)
+        worker.failed.connect(self._avatar_parts_analysis_failed)
+        worker.finished.connect(self._avatar_parts_analysis_finished)
+        worker.start()
+
+    def _avatar_parts_analysis_succeeded(self, result: dict[str, Any]) -> None:
+        self._open_project_file(self.project_path)
+        self.refresh_library()
+        analysis = result.get("analysis", {})
+        region_labels = {
+            "head_hair_or_face": "Cabeza/cabello/cara",
+            "torso_or_neck": "Torso/cuello",
+            "hips_or_torso": "Cadera/torso",
+            "arms_or_hands": "Brazos/manos",
+            "legs_or_lower_body": "Piernas",
+            "feet_or_ground_accessory": "Pies/accesorios inferiores",
+            "unknown": "Sin clasificar",
+        }
+        lines = [
+            f"Objetos de malla: {analysis.get('mesh_object_count', 0)}",
+            f"Piezas geométricas desconectadas: {analysis.get('component_count', 0)}",
+            f"Piezas que cruzan regiones y requieren corte semántico: {analysis.get('cross_region_component_count', 0)}",
+            f"Vértices: {analysis.get('vertex_count', 0)}",
+            "",
+            "Propuestas automáticas por región:",
+        ]
+        for region, values in analysis.get("region_summary", {}).items():
+            lines.append(f"• {region_labels.get(region, region)}: {values.get('component_count', 0)} piezas")
+        facial = analysis.get("facial_feature_candidates", {})
+        lines.extend([
+            "",
+            f"Componentes en zona compatible con ojos: {facial.get('eye_candidate', {}).get('component_count', 0)}",
+            f"Componentes en zona compatible con boca: {facial.get('mouth_candidate', {}).get('component_count', 0)}",
+            "El informe completo quedó guardado en el proyecto. Revisa las propuestas antes de extraerlas.",
+        ])
+        if analysis.get("warnings"):
+            lines.extend(["", *analysis["warnings"]])
+        QMessageBox.information(self, "Análisis de piezas 3D", "\n".join(lines))
+
+    def _avatar_parts_analysis_failed(self, message: str) -> None:
+        self.avatar3d_info.setText(message)
+        QMessageBox.warning(self, "No pude analizar las piezas", message)
+
+    def _avatar_parts_analysis_finished(self) -> None:
+        self.avatar_parts_worker = None
+        if self.project_path is not None:
+            data = load_project(self.project_path)
+            avatar = data.get("avatar3d", {})
+            self.avatar3d_parts_button.setEnabled(self.blender_available and avatar.get("format") == "glb")
+            source_path = avatar.get("source_path")
+            source_exists = bool(source_path and (self.project_path.parent / source_path).is_file())
+            self.avatar3d_blender_button.setEnabled(bool(
+                self.blender_available and avatar.get("format") == "glb"
+                and (not avatar.get("rigged") or source_exists)
+            ))
 
     def _open_avatar3d_viewer(self, *, model_path_override: Path | None = None, allow_autorig_override: bool | None = None) -> None:
         if self.project_path is None:
@@ -2202,6 +2370,11 @@ class MainWindow(QMainWindow):
 
     def _render_current_pose(self) -> None:
         if self.project_path is None:
+            return
+        if self.canvas.image_path is None:
+            self.canvas.composite_preview = None
+            self.canvas.preview_enabled = False
+            self.canvas.viewport().update()
             return
         try:
             data = load_project(self.project_path)
