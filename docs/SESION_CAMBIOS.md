@@ -49,3 +49,9 @@
 - La inspección del GLB compartido encontró muestras distales en ambos lados; el cambio usa esos grupos para orientar el ajuste de cada mano.
 - La captura siguiente reveló que el detector anterior ubicaba hombros demasiado abajo y confundía vértices del torso con manos. Se añadió detección de brazos extendidos, una banda de muestreo alrededor de los hombros y articulaciones de brazo interpoladas entre hombro y muñeca.
 - `npm run build` en `viewer3d/`: completado. Vite conserva el aviso no bloqueante sobre el tamaño del bundle.
+
+## 2026-11-02 — preparación para trabajar desde otra PC
+
+- Se documentaron requisitos, clonación e instalación en Windows y Linux, y cómo volver a iniciar RigM en cada sistema.
+- Se explicó qué carpetas acompañan a un proyecto `.rigm` al trasladarlo (`assets/`) y por qué no se deben reutilizar `.venv/` ni `node_modules/` entre equipos.
+- Como los commits actuales aún no están publicados en GitHub, se generó un Git bundle local para transferir el historial completo de `main`; se verificó con `git bundle verify`.

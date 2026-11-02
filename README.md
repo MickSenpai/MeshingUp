@@ -36,19 +36,70 @@ La [investigación sobre rigging 2D](docs/INVESTIGACION_RIG_2D.md) recoge el flu
 La [guía de animación reactiva](docs/ANIMACION_REACTIVA.md) describe la API de eventos, la simulación de Meido y sus límites actuales.
 El [estudio de avatar reactivo 2D/3D](docs/ESTUDIO_AVATAR_REACTIVO_2D_3D.md) compara rutas, formatos humanoides, mezcla de movimiento y una arquitectura recomendada para Meido.
 
-## Ejecutar
+## Preparar RigM en otra PC
 
-Requiere Python 3.10+, PyQt6 y Pillow:
+### Requisitos
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e '.[rigging,avatar3d]'
-cd viewer3d && npm ci && npm run build && cd ..
-rigm
+- Git.
+- Python 3.10 o posterior.
+- Node.js 20.19 o posterior (LTS) y npm. El visor 3D local se compila desde `viewer3d/`.
+- Windows 10/11 o una distribución Linux de escritorio. El visor 3D necesita WebGL; en escritorios Linux mínimos puede requerir bibliotecas de Qt WebEngine y gráficos del sistema.
+
+No copies `.venv/` ni `node_modules/` desde otra PC: contienen dependencias específicas del sistema operativo. Ejecuta el instalador en cada equipo.
+
+### Windows PowerShell
+
+Después de publicar los cambios en GitHub, abre PowerShell y ejecuta:
+
+```powershell
+git clone https://github.com/MickSenpai/RigM.git
+cd RigM
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1
+.\.venv\Scripts\rigm.exe
 ```
 
-En Windows PowerShell usa `scripts\\install_windows.ps1`; en Linux usa `bash scripts/install_linux.sh`. Ambos crean `.venv`, instalan PyQt6/WebEngine y rigging, e instalan/compilan el visor local Three.js. Requieren Python 3.10+ y Node.js 20.19+ con npm. En Linux minimalista, Qt WebEngine puede requerir bibliotecas gráficas del sistema de la distribución.
+Para abrir RigM más adelante:
+
+```powershell
+cd ruta\a\RigM
+.\.venv\Scripts\rigm.exe
+```
+
+### Linux
+
+```bash
+git clone https://github.com/MickSenpai/RigM.git
+cd RigM
+bash scripts/install_linux.sh
+.venv/bin/rigm
+```
+
+Para abrirlo después, ejecuta `.venv/bin/rigm` desde la carpeta del repositorio. En Debian/Ubuntu el instalador intenta preparar las bibliotecas gráficas de Qt WebEngine con `apt-get`; en otras distribuciones, instala las bibliotecas Qt/XCB/WebEngine que indique el sistema.
+
+### Transferir esta copia antes de publicarla
+
+Los commits locales no aparecen al clonar GitHub hasta que se publiquen. Para llevar el estado actual del repositorio a otra PC sin esperar al push, crea un bundle en esta PC:
+
+```bash
+git bundle create work/RigM-transfer.bundle main
+```
+
+Copia `work/RigM-transfer.bundle` a la otra PC y clónalo desde la carpeta donde lo guardaste:
+
+```bash
+git clone RigM-transfer.bundle RigM
+cd RigM
+```
+
+Después instala las dependencias con las instrucciones de Windows o Linux de arriba. Si quieres conectar esa copia con GitHub cuando tengas autenticación, ejecuta `git remote set-url origin https://github.com/MickSenpai/RigM.git` y luego sincroniza o publica la rama `main`.
+
+### Llevar proyectos entre equipos
+
+Cada proyecto guarda sus recursos con rutas relativas. Para trasladarlo, copia el archivo `.rigm` **junto con la carpeta `assets/` que está a su lado**; ahí se guardan la imagen de referencia y los GLB/VRM importados o generados. Mantén esa estructura al copiarla a la otra PC. El código del programa y los proyectos son transferencias separadas: instala RigM en la nueva PC y luego abre el `.rigm` desde su biblioteca.
+
+## Ejecutar
+
+Los instaladores crean el entorno `.venv`, instalan RigM con PyQt6/WebEngine y las dependencias de rigging, instalan las dependencias exactas del visor con `npm ci` y compilan Three.js. Requieren Python 3.10+ y Node.js 20.19+ con npm. El auto-rig del visor funciona localmente sin Blender.
 
 Para activar la reconstrucción local de zonas ocultas, instala el extra opcional: `python -m pip install -e '.[inpaint]'`.
 Para activar la segmentación SAM 2, instala: `python -m pip install -e '.[segmentation]'`.
