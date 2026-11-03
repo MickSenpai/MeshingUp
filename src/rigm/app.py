@@ -962,7 +962,7 @@ class MainWindow(QMainWindow):
         avatar_layout.addWidget(self.avatar3d_blender_button)
         self.avatar3d_rebuild_button = QPushButton("Rehacer esqueleto desde fuente")
         self.avatar3d_rebuild_button.setEnabled(False)
-        self.avatar3d_rebuild_button.setToolTip("Vuelve al GLB original conservado en el proyecto y genera un rig nuevo.")
+        self.avatar3d_rebuild_button.setToolTip("Abre el GLB original, sin rig, en el visor. No genera huesos. Para crear un rig usa el botón de Blender.")
         self.avatar3d_rebuild_button.clicked.connect(self._rebuild_avatar3d_from_source)
         avatar_layout.addWidget(self.avatar3d_rebuild_button)
         avatar_layout.addWidget(self.avatar3d_viewer_button)
@@ -1160,10 +1160,25 @@ class MainWindow(QMainWindow):
         if not isinstance(avatar, dict):
             avatar = {}
         self.avatar3d_viewer_button.setEnabled(bool(avatar))
+        if avatar:
+            model_name = str(avatar.get("name", "Avatar 3D"))
+            self.avatar3d_placeholder.setText(
+                f"Modelo disponible: {model_name}.\nPulsa «Abrir visor 3D» para cargarlo aquí."
+            )
+        else:
+            self.avatar3d_placeholder.setText("Importa un GLB/VRM y abre la vista 3D para previsualizarlo.")
         self.avatar3d_parts_button.setEnabled(bool(
             self.blender_available and avatar.get("format") == "glb"
         ))
-        self.avatar3d_autorig_button.setEnabled(bool(avatar and avatar.get("format") == "glb" and not avatar.get("rigged")))
+        geometric_source = avatar.get("source_path") if isinstance(avatar, dict) else None
+        geometric_source_exists = bool(geometric_source and (self.project_path.parent / geometric_source).is_file())
+        can_geometric_rig = bool(avatar.get("format") == "glb" and (not avatar.get("rigged") or geometric_source_exists))
+        self.avatar3d_autorig_button.setEnabled(can_geometric_rig)
+        self.avatar3d_autorig_button.setToolTip(
+            "Usa geometría Three.js; si ya existe un rig, lo rehace desde la fuente preservada. Confianza baja; revisa el resultado."
+            if avatar.get("rigged") else
+            "Usa la inferencia heurística de Three.js sobre el GLB sin esqueleto. Confianza baja; revisa el resultado."
+        )
         source_model = avatar.get("source_path")
         source_model_exists = bool(source_model and (self.project_path.parent / source_model).is_file())
         can_blender_rig = bool(
@@ -1171,7 +1186,14 @@ class MainWindow(QMainWindow):
             and (not avatar.get("rigged") or source_model_exists)
         )
         self.avatar3d_blender_button.setEnabled(can_blender_rig)
-        self.avatar3d_blender_button.setText("Rehacer rig con Blender" if avatar.get("rigged") else "Crear rig con Blender")
+        self.avatar3d_blender_button.setText("Regenerar rig (Blender)" if avatar.get("rigged") else "Crear rig con Blender")
+        self.avatar3d_blender_button.setToolTip(
+            "Crea un rig nuevo desde el GLB original. Las correcciones del rig activo no se copian; el resultado pasa a ser el activo y se conservan hasta tres generaciones."
+            if avatar.get("rigged") else
+            "Crea huesos y pesos para el GLB importado. El archivo fuente se conserva intacto."
+        )
+        self.avatar3d_rebuild_button.setText("Ver fuente original")
+        self.avatar3d_rebuild_button.setToolTip("Abre el GLB original sin esqueleto en el visor. No crea un rig; usa «Regenerar rig (Blender)» para generar uno nuevo desde esa fuente.")
         self.avatar3d_rebuild_button.setEnabled(bool(
             avatar.get("format") == "glb" and avatar.get("rigged") and source_model
             and (self.project_path.parent / source_model).is_file()
@@ -1255,10 +1277,23 @@ class MainWindow(QMainWindow):
             self.reload_button.setEnabled(True)
             return
         avatar = load_project(self.project_path).get("avatar3d", {})
-        if avatar.get("format") != "glb" or avatar.get("rigged"):
-            QMessageBox.information(self, "Auto-rig 3D", "Importa primero un GLB sin esqueleto.")
+        if avatar.get("format") != "glb":
+            QMessageBox.information(self, "Auto-rig 3D", "El auto-rig geométrico requiere un GLB.")
             return
-        self._open_avatar3d_viewer()
+        model_path_override = None
+        allow_autorig_override = None
+        if avatar.get("rigged"):
+            source = avatar.get("source_path")
+            if not source:
+                QMessageBox.information(self, "Fuente no disponible", "Este rig no conserva el GLB original para rehacerlo.")
+                return
+            source_path = (self.project_path.parent / source).resolve()
+            if not source_path.is_relative_to(self.project_path.parent.resolve()) or not source_path.is_file():
+                QMessageBox.warning(self, "Fuente no disponible", "No encuentro el GLB fuente conservado dentro del proyecto.")
+                return
+            model_path_override = source_path
+            allow_autorig_override = True
+        self._open_avatar3d_viewer(model_path_override=model_path_override, allow_autorig_override=allow_autorig_override)
         dialog = getattr(self, "avatar3d_dialog", None)
         if dialog and dialog.allow_autorig:
             dialog.request_autorig()

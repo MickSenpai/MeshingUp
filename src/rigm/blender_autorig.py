@@ -221,6 +221,9 @@ bones = []
 hand_finger_layout_by_side = {}
 arm_component_sizes = {}
 hand_finger_track_counts = {}
+hand_finger_separation = {}
+hand_landmark_diagnostics = {}
+leg_landmark_diagnostics = {}
 
 
 def find_arm_component_points(side_direction):
@@ -301,6 +304,7 @@ def infer_hand_finger_tracks(side_name, side_direction, component_points):
         candidates.append((point, lateral, depth))
     if len(candidates) < 80:
         hand_finger_track_counts[side_name] = {"candidate_vertices": len(candidates), "tracks": 0}
+        hand_finger_separation[side_name] = {"confidence": "low", "reason": "insufficient_distal_samples", "sample_count": len(candidates)}
         return []
 
     def quantile(values, fraction):
@@ -309,6 +313,39 @@ def infer_hand_finger_tracks(side_name, side_direction, component_points):
 
     depths = [item[2] for item in candidates]
     depth_low, depth_high = quantile(depths, 0.05), quantile(depths, 0.95)
+    # Four quantiles below always produce four candidate chains. Measure the
+    # actual distal occupancy separately so that this is never mistaken for
+    # evidence that four fingers are geometrically separated.
+    bin_count = 32
+    span = max(depth_high - depth_low, height * 0.004)
+    histogram = [0] * bin_count
+    for depth in depths:
+        index = min(bin_count - 1, max(0, int((depth - depth_low) / span * bin_count)))
+        histogram[index] += 1
+    smooth = [sum(histogram[max(0, i - 1):min(bin_count, i + 2)]) for i in range(bin_count)]
+    peaks = [i for i in range(1, bin_count - 1) if smooth[i] >= smooth[i - 1] and smooth[i] > smooth[i + 1]]
+    peak_floor = max(2, int(max(smooth, default=0) * 0.22))
+    peaks = [i for i in peaks if smooth[i] >= peak_floor]
+    selected_peaks = []
+    for peak in sorted(peaks, key=lambda i: smooth[i], reverse=True):
+        if all(abs(peak - kept) >= 2 for kept in selected_peaks):
+            selected_peaks.append(peak)
+    selected_peaks.sort()
+    valley_ratios = []
+    for first, second in zip(selected_peaks, selected_peaks[1:]):
+        valley = min(smooth[first:second + 1])
+        valley_ratios.append(round(valley / max(1, min(smooth[first], smooth[second])), 3))
+    separated_gaps = sum(value <= 0.55 for value in valley_ratios)
+    confidence = "medium" if len(selected_peaks) in (3, 4, 5) and separated_gaps >= 2 else "low"
+    hand_finger_separation[side_name] = {
+        "method": "distal_depth_occupancy_v1", "sample_count": len(candidates),
+        "candidate_chains_generated": 4, "detected_occupancy_peaks": len(selected_peaks),
+        "chain_label_order": "Index_to_Little_by_descending_depth_quantile",
+        "peak_depth_ratios": [round(i / (bin_count - 1), 3) for i in selected_peaks],
+        "valley_to_peak_ratios": valley_ratios, "clear_gaps": separated_gaps,
+        "confidence": confidence,
+        "note": "Los picos estiman valles visibles en la nube; no confirman separación topológica ni el orden anatómico de los dedos. Se usa orden descendente de profundidad para el modelo observado; requiere revisión en otros modelos."
+    }
     band_width = max(height * 0.012, (depth_high - depth_low) * 0.075)
     tracks = []
     for fraction in (0.13, 0.37, 0.63, 0.87):
@@ -327,19 +364,24 @@ def infer_hand_finger_tracks(side_name, side_direction, component_points):
             base_band = band
         if not tip_band:
             tip_band = band
-        base_depth = quantile([item[2] for item in base_band], 0.5)
-        tip_depth = quantile([item[2] for item in tip_band], 0.5)
+        # Each chain belongs to one depth lane. Interpolating between medians
+        # of independently sampled base/tip bands made bones drift sideways
+        # through the palm when the mesh was sparse or asymmetric.
+        track_depth = center_depth
         base_z = quantile([item[0].z for item in base_band], 0.5)
         tip_z = quantile([item[0].z for item in tip_band], 0.5)
 
         def position(progress):
             lateral = base_side + (tip_side - base_side) * progress
-            depth = base_depth + (tip_depth - base_depth) * progress
             z = base_z + (tip_z - base_z) * progress
-            return point_at(side_direction * lateral, depth, z)
+            return point_at(side_direction * lateral, track_depth, z)
 
         tracks.append((position(0.0), position(0.30), position(0.66), position(1.0)))
-    hand_finger_track_counts[side_name] = {"candidate_vertices": len(candidates), "tracks": len(tracks)}
+    hand_finger_track_counts[side_name] = {"candidate_vertices": len(candidates), "tracks": len(tracks), "geometry_confidence": confidence}
+    # The viewer inspection of Meido established that increasing depth maps
+    # from the thumb/index edge toward the little-finger edge in reverse of
+    # the old labels. Keep this convention explicit in the diagnostic report.
+    tracks.reverse()
     return tracks if len(tracks) == 4 else []
 
 
@@ -389,23 +431,87 @@ for side_name, sign in (("left", 1), ("right", -1)):
             z = heights[(len(heights) - 1) // 2]
             return point_at(sign * lateral_target, depth, z)
 
-        # Fit the arm chain to the connected outboard island; retain the
-        # silhouette estimate only when a coherent arm component is absent.
-        wrist, hand = (component_landmark(f) for f in (0.78, 0.985))
+        # Find the wrist at the narrowest robust cross-section between forearm
+        # and palm. A fixed lateral percentile often lands inside the palm on
+        # stylized meshes, which makes the hand bone start too far outboard.
+        lateral_min = sorted(component_lateral)[int((len(component_lateral) - 1) * 0.60)]
+        lateral_max = sorted(component_lateral)[int((len(component_lateral) - 1) * 0.88)]
+        bin_width = max(height * 0.012, (lateral_max - lateral_min) / 32.0)
+        wrist_candidates = []
+        for bin_index in range(32):
+            low = lateral_min + (lateral_max - lateral_min) * bin_index / 32.0
+            high = min(lateral_max, low + bin_width)
+            band = [point for point, lateral in zip(arm_region, component_lateral) if low <= lateral <= high]
+            if len(band) < 8:
+                continue
+            depths = sorted((point[forward_index] - center[forward_index]) * forward_sign for point in band)
+            heights = sorted(point.z for point in band)
+            q10 = lambda values: values[int((len(values) - 1) * 0.10)]
+            q90 = lambda values: values[int((len(values) - 1) * 0.90)]
+            depth_span = q90(depths) - q10(depths)
+            vertical_span = q90(heights) - q10(heights)
+            # Reject undersampled slices that look artificially narrow.
+            area_proxy = max(depth_span, height * 0.006) * max(vertical_span, height * 0.006)
+            lateral_center = sorted([lateral for lateral in component_lateral if low <= lateral <= high])[len(band) // 2]
+            wrist_candidates.append((area_proxy, lateral_center, len(band), depth_span, vertical_span))
+        best_wrist = min(wrist_candidates, key=lambda item: item[0]) if wrist_candidates else None
+        best_wrist_ratio = (
+            (best_wrist[1] - lateral_min) / max(lateral_max - lateral_min, 1e-8)
+            if best_wrist else -1.0
+        )
+        # A minimum at the boundary is usually a clipped fingertip/sleeve
+        # sample, not a wrist. Fall back to the stable arm quantile then.
+        if best_wrist and 0.10 <= best_wrist_ratio <= 0.43 and best_wrist[2] >= 12:
+            wrist_area, wrist_lateral, wrist_samples, wrist_depth_span, wrist_vertical_span = best_wrist
+            wrist_band = [point for point, lateral in zip(arm_region, component_lateral) if abs(lateral - wrist_lateral) <= bin_width]
+            wrist_depths = sorted((point[forward_index] - center[forward_index]) * forward_sign for point in wrist_band)
+            wrist_heights = sorted(point.z for point in wrist_band)
+            wrist = point_at(sign * wrist_lateral, wrist_depths[len(wrist_depths) // 2], wrist_heights[len(wrist_heights) // 2])
+            wrist_method = "minimum_robust_cross_section_v1"
+        else:
+            wrist = component_landmark(0.65)
+            wrist_lateral = (wrist[side_index] - center[side_index]) * side_sign * sign
+            wrist_area = wrist_depth_span = wrist_vertical_span = 0.0
+            wrist_samples = best_wrist[2] if best_wrist else 0
+            wrist_method = "lateral_quantile_fallback_ambiguous_cross_section"
+        hand_landmark_diagnostics[side_name] = {
+            "method": wrist_method,
+            "wrist_position": [round(value, 5) for value in wrist],
+            "wrist_lateral_ratio": round((wrist_lateral - lateral_min) / max(lateral_max - lateral_min, 1e-8), 4),
+            "cross_section_samples": wrist_samples,
+            "depth_span_height_ratio": round(wrist_depth_span / height, 5),
+            "vertical_span_height_ratio": round(wrist_vertical_span / height, 5),
+        }
         outside = max(component_lateral)
         wrist_z = wrist.z
         wrist_side = sign * abs((wrist[side_index] - center[side_index]) * side_sign)
         wrist_z2 = wrist.z
-        # Refit the elbow from the same measured chain. Previously only the
-        # wrist/hand were replaced, leaving the elbow aimed at the old
-        # silhouette estimate (which may have been influenced by hair).
-        elbow = shoulder.lerp(wrist, 0.52)
+        # Place the elbow halfway along the shoulder-to-wrist lateral axis,
+        # then sample depth/height from the arm surface there. A global point
+        # cloud median is biased toward the hand on this connected island.
+        shoulder_lateral = (shoulder[side_index] - center[side_index]) * side_sign * sign
+        elbow_target = shoulder_lateral + (abs(wrist_side) - shoulder_lateral) * 0.52
+        elbow_band = [
+            point for point, lateral in zip(arm_region, component_lateral)
+            if abs(lateral - elbow_target) <= height * 0.018
+        ]
+        if len(elbow_band) < 8:
+            elbow_band = sorted(arm_region, key=lambda point: abs(
+                (point[side_index] - center[side_index]) * side_sign * sign - elbow_target
+            ))[:max(8, len(arm_region) // 100)]
+        elbow_depths = sorted((point[forward_index] - center[forward_index]) * forward_sign for point in elbow_band)
+        elbow_heights = sorted(point.z for point in elbow_band)
+        elbow = point_at(
+            sign * elbow_target,
+            elbow_depths[len(elbow_depths) // 2],
+            elbow_heights[len(elbow_heights) // 2],
+        )
+        hand_landmark_diagnostics[side_name]["elbow_position"] = [round(value, 5) for value in elbow]
         elbow_side = sign * abs((elbow[side_index] - center[side_index]) * side_sign)
         elbow_z = elbow.z
     add_bone(side_name + "Shoulder", body_point(sign * torso_width * 0.43, chest_z), shoulder, "chest")
     add_bone(side_name + "UpperArm", shoulder, elbow, side_name + "Shoulder")
     add_bone(side_name + "LowerArm", elbow, wrist, side_name + "UpperArm")
-    add_bone(side_name + "Hand", wrist, hand, side_name + "LowerArm")
     palm_side = sign * (abs(wrist_side) + (outside - abs(wrist_side)) * 0.34)
     palm_front = height * 0.018
     finger_tracks = infer_hand_finger_tracks(side_name, sign, arm_component)
@@ -421,25 +527,110 @@ for side_name, sign in (("left", 1), ("right", -1)):
                 body_point(palm_side + sign * finger_length * 0.65, wrist_z, finger_front),
                 body_point(palm_side + sign * finger_length, wrist_z, finger_front),
             ))
+    # End the Hand bone at the knuckle line (mean finger root), not at the
+    # outermost fingertip. A wrist-to-fingertip Hand bone crosses the whole
+    # palm and makes the wrist/hand mapping look offset in the viewer.
+    hand = sum((track[0] for track in finger_tracks), Vector()) / max(1, len(finger_tracks))
+    hand_landmark_diagnostics[side_name]["palm_center"] = [round(value, 5) for value in hand]
+    add_bone(side_name + "Hand", wrist, hand, side_name + "LowerArm")
     for finger_name, track in zip(("Index", "Middle", "Ring", "Little"), finger_tracks):
         base, knuckle, middle, tip = track
         prefix = side_name + finger_name
         add_bone(prefix + "Proximal", base, knuckle, side_name + "Hand")
         add_bone(prefix + "Intermediate", knuckle, middle, prefix + "Proximal")
         add_bone(prefix + "Distal", middle, tip, prefix + "Intermediate")
-    thumb_base = body_point(palm_side - sign * height * 0.008, wrist_z + height * 0.004, palm_front - forward_sign * side_sign * height * 0.018)
-    thumb_mid = body_point(palm_side + sign * height * 0.006, wrist_z + height * 0.01, palm_front - forward_sign * side_sign * height * 0.034)
-    thumb_tip = body_point(palm_side + sign * height * 0.022, wrist_z + height * 0.016, palm_front - forward_sign * side_sign * height * 0.047)
+    # Anchor and scale the thumb from the measured palm/finger geometry. Using
+    # fractions of whole-body height made the thumb much longer than this
+    # character's actual fingers and pushed its tip outside the hand.
+    index_base, _index_knuckle, _index_middle, index_tip = finger_tracks[0]
+    little_base = finger_tracks[-1][0]
+    finger_axis = (index_tip - index_base).normalized()
+    spread_axis = (little_base - index_base).normalized()
+    if finger_axis.length_squared < 1e-8:
+        finger_axis = (hand - wrist).normalized()
+    if spread_axis.length_squared < 1e-8:
+        spread_axis = Vector((0, 0, 1))
+    thumb_out = -spread_axis
+    measured_finger_length = (index_tip - index_base).length
+    if measured_finger_length < height * 0.006:
+        measured_finger_length = (hand - wrist).length * 0.42
+    measured_finger_length = max(height * 0.008, min(measured_finger_length, height * 0.035))
+    thumb_base = index_base + thumb_out * (measured_finger_length * 0.08)
+    thumb_mid = thumb_base + finger_axis * (measured_finger_length * 0.28) + thumb_out * (measured_finger_length * 0.28)
+    thumb_tip = thumb_mid + finger_axis * (measured_finger_length * 0.42) + thumb_out * (measured_finger_length * 0.18)
+    thumb_end = thumb_tip + finger_axis * (measured_finger_length * 0.30) + thumb_out * (measured_finger_length * 0.06)
     add_bone(side_name + "ThumbMetacarpal", thumb_base, thumb_mid, side_name + "Hand")
     add_bone(side_name + "ThumbProximal", thumb_mid, thumb_tip, side_name + "ThumbMetacarpal")
-    add_bone(side_name + "ThumbDistal", thumb_tip, body_point(palm_side + sign * height * 0.032, wrist_z + height * 0.02, palm_front - forward_sign * side_sign * height * 0.055), side_name + "ThumbProximal")
+    add_bone(side_name + "ThumbDistal", thumb_tip, thumb_end, side_name + "ThumbProximal")
     hip = body_point(sign * hip_half, hip_z)
-    knee = body_point(sign * knee_half, zmin + height * 0.27)
-    ankle = body_point(sign * ankle_half, zmin + height * 0.055)
-    toe = body_point(sign * ankle_half, zmin + height * 0.035, height * 0.12)
+    knee_z = zmin + height * 0.27
+    ankle_z = zmin + height * 0.055
+
+    def leg_slice_landmark(target_z, tolerance):
+        band = []
+        for point in points:
+            lateral = (point[side_index] - center[side_index]) * side_sign * sign
+            if lateral >= max(height * 0.018, hip_half * 0.18) and abs(point.z - target_z) <= tolerance:
+                band.append((point, lateral, (point[forward_index] - center[forward_index]) * forward_sign))
+        if len(band) < 8:
+            return None
+        lateral_values = sorted(item[1] for item in band)
+        forward_values = sorted(item[2] for item in band)
+        z_values = sorted(item[0].z for item in band)
+        middle = (len(band) - 1) // 2
+        return point_at(
+            sign * lateral_values[middle],
+            forward_values[middle],
+            z_values[middle],
+        ), len(band)
+
+    knee_sample = leg_slice_landmark(knee_z, height * 0.035)
+    ankle_sample = leg_slice_landmark(ankle_z, height * 0.025)
+    knee = knee_sample[0] if knee_sample else body_point(sign * knee_half, knee_z)
+    ankle = ankle_sample[0] if ankle_sample else body_point(sign * ankle_half, ankle_z)
+
+    foot_points = []
+    for point in points:
+        lateral = (point[side_index] - center[side_index]) * side_sign * sign
+        if lateral >= max(height * 0.018, hip_half * 0.18) and zmin + height * 0.008 <= point.z <= zmin + height * 0.12:
+            forward = (point[forward_index] - center[forward_index]) * forward_sign
+            foot_points.append((point, lateral, forward))
+    if len(foot_points) >= 8:
+        front_threshold = sorted(item[2] for item in foot_points)[int((len(foot_points) - 1) * 0.88)]
+        ball_threshold = sorted(item[2] for item in foot_points)[int((len(foot_points) - 1) * 0.58)]
+        toe_band = [item for item in foot_points if item[2] >= front_threshold]
+        ball_band = [item for item in foot_points if ball_threshold <= item[2] < front_threshold]
+        toe = point_at(
+            sign * sorted(item[1] for item in toe_band)[(len(toe_band) - 1) // 2],
+            sorted(item[2] for item in toe_band)[(len(toe_band) - 1) // 2],
+            sorted(item[0].z for item in toe_band)[(len(toe_band) - 1) // 2],
+        )
+        ball = point_at(
+            sign * sorted(item[1] for item in ball_band)[(len(ball_band) - 1) // 2],
+            sorted(item[2] for item in ball_band)[(len(ball_band) - 1) // 2],
+            sorted(item[0].z for item in ball_band)[(len(ball_band) - 1) // 2],
+        )
+        foot_method = "mesh_low_front_quartile_v1"
+    else:
+        toe = body_point(sign * ankle_half, zmin + height * 0.035, height * 0.12)
+        ball = ankle.lerp(toe, 0.72)
+        foot_method = "proportional_fallback"
+    leg_landmark_diagnostics[side_name] = {
+        "knee_method": "mesh_cross_section_median" if knee_sample else "proportional_fallback",
+        "knee_samples": knee_sample[1] if knee_sample else 0,
+        "knee_position": [round(value, 5) for value in knee],
+        "ankle_method": "mesh_cross_section_median" if ankle_sample else "proportional_fallback",
+        "ankle_samples": ankle_sample[1] if ankle_sample else 0,
+        "ankle_position": [round(value, 5) for value in ankle],
+        "foot_method": foot_method,
+        "foot_samples": len(foot_points),
+        "ball_position": [round(value, 5) for value in ball],
+        "toe_position": [round(value, 5) for value in toe],
+    }
     add_bone(side_name + "UpperLeg", hip, knee, "hips")
     add_bone(side_name + "LowerLeg", knee, ankle, side_name + "UpperLeg")
-    add_bone(side_name + "Foot", ankle, toe, side_name + "LowerLeg")
+    add_bone(side_name + "Foot", ankle, ball, side_name + "LowerLeg")
+    add_bone(side_name + "Toes", ball, toe, side_name + "Foot")
 
 arm_data = bpy.data.armatures.new("RigM_AutoRig")
 arm_obj = bpy.data.objects.new("RigM_AutoRig", arm_data)
@@ -643,6 +834,10 @@ def correct_head_and_arm_weights():
     head_corrected = 0
     arm_plane_corrected = 0
     hand_corrected = {"left": 0, "right": 0}
+    wrist_stats = {
+        side: {"sampled_vertices": 0, "corrected_vertices": 0, "hand_weight_sum": 0.0, "lower_arm_weight_sum": 0.0}
+        for side in ("left", "right")
+    }
     # Keep the sleeve cap attached to the shoulder. The plane is deliberately
     # inside the shoulder landmark and only affects the torso vertical band.
     arm_plane = shoulder_half * 0.82
@@ -657,6 +852,13 @@ def correct_head_and_arm_weights():
         side: {name for name in arm_names if name.startswith(side)}
         for side in ("left", "right")
     }
+    digit_suffixes = (
+        "IndexProximal", "IndexIntermediate", "IndexDistal",
+        "MiddleProximal", "MiddleIntermediate", "MiddleDistal",
+        "RingProximal", "RingIntermediate", "RingDistal",
+        "LittleProximal", "LittleIntermediate", "LittleDistal",
+        "ThumbMetacarpal", "ThumbProximal", "ThumbDistal",
+    )
     for obj in meshes:
         groups_by_index = {index: group for index, group in enumerate(obj.vertex_groups)}
         arm_group_indices = {index for index, group in groups_by_index.items() if group.name in arm_names}
@@ -705,49 +907,48 @@ def correct_head_and_arm_weights():
                             weights[nearest_index] = weights.get(nearest_index, 0.0) + removed_weight
                     arm_plane_corrected += 1
 
-            # The distance fallback often gives the long forearm segment most
-            # of the palm because the generated hand bone is short. Pull the
-            # distal palm region onto Hand so rotating the wrist moves it too.
+            # Blend between forearm and palm using their geometric distances.
+            # This avoids the previous hard 65% hand floor, which cut across
+            # the wrist and made the sleeve/palm snap when the wrist rotated.
             for side, side_direction in (("left", 1), ("right", -1)):
                 hand_name = side + "Hand"
                 hand_index = next((index for index, group in groups_by_index.items() if group.name == hand_name), None)
-                if hand_index is None:
+                lower_name = side + "LowerArm"
+                lower_index = next((index for index, group in groups_by_index.items() if group.name == lower_name), None)
+                if hand_index is None or lower_index is None:
                     continue
                 hand_head, hand_tail = bone_by_name[hand_name]
+                lower_head, lower_tail = bone_by_name[lower_name]
                 hand_distance = segment_distance(point, hand_head, hand_tail)
-                hand_side = (hand_head[side_index] - center[side_index]) * side_sign * side_direction
-                point_side = signed_side * side_direction
-                if (
-                    point_side < hand_side - height * 0.018
-                    or hand_distance > height * 0.055
-                ):
+                lower_distance = segment_distance(point, lower_head, lower_tail)
+                if min(hand_distance, lower_distance) > height * 0.05:
                     continue
+                stats = wrist_stats[side]
                 digit_indices = {
                     index for index, group in groups_by_index.items()
-                    if group.name.startswith(side) and group.name.endswith((
-                        "IndexProximal", "IndexIntermediate", "IndexDistal",
-                        "MiddleProximal", "MiddleIntermediate", "MiddleDistal",
-                        "RingProximal", "RingIntermediate", "RingDistal",
-                        "LittleProximal", "LittleIntermediate", "LittleDistal",
-                        "ThumbMetacarpal", "ThumbProximal", "ThumbDistal",
-                    ))
+                    if group.name.startswith(side) and group.name.endswith(digit_suffixes)
                 }
-                if sum(weights.get(index, 0.0) for index in digit_indices) >= 0.35:
-                    continue
-                current_hand = weights.get(hand_index, 0.0)
-                target_hand = max(current_hand, 0.65)
-                if target_hand <= current_hand + 1e-8:
-                    continue
-                other_total = sum(weight for index, weight in weights.items() if index != hand_index)
-                if other_total > 1e-8:
-                    scale = (1.0 - target_hand) / other_total
-                    for index in list(weights):
-                        if index != hand_index:
-                            weights[index] *= scale
-                else:
-                    target_hand = 1.0
+                stats["sampled_vertices"] += 1
+                blend = max(0.0, min(1.0, 0.5 + (lower_distance - hand_distance) / max(height * 0.04, 1e-8)))
+                target_hand = blend * blend * (3.0 - 2.0 * blend)
+                # Keep existing finger influence, but always allocate the
+                # remaining weight between Hand and LowerArm. Skipping these
+                # vertices when fingers had >35% influence left a hole in the
+                # wrist transition, especially on this mesh's connected palm.
+                digit_weights = {index: weights[index] for index in digit_indices if weights.get(index, 0.0) > 1e-8}
+                digit_total = min(1.0, sum(digit_weights.values()))
+                wrist_total = 1.0 - digit_total
+                target_hand *= wrist_total
+                target_lower = wrist_total - target_hand
+                for index in list(weights):
+                    if index not in digit_indices:
+                        weights.pop(index, None)
+                weights[lower_index] = target_lower
                 weights[hand_index] = target_hand
                 hand_corrected[side] += 1
+                stats["corrected_vertices"] += 1
+                stats["hand_weight_sum"] += target_hand
+                stats["lower_arm_weight_sum"] += target_lower
 
             total = sum(weights.values())
             if total > 1e-8 and weights != {index: weight for index, weight in existing}:
@@ -756,11 +957,20 @@ def correct_head_and_arm_weights():
                 for index, weight in weights.items():
                     groups_by_index[index].add([vertex.index], weight / total, "REPLACE")
     return {
-        "method": "mesh2motion_inspired_head_arm_correction_v2",
+        "method": "distance_blended_wrist_weights_v2_preserve_digits",
         "head_corrected_vertex_count": head_corrected,
         "torso_arm_plane_corrected_vertex_count": arm_plane_corrected,
         "hand_region_corrected_vertex_count": hand_corrected,
-        "hand_minimum_influence": 0.65,
+        "wrist_weight_transition": "smoothstep_between_Hand_and_LowerArm_segment_distances",
+        "wrist_transition_half_width_height_ratio": 0.02,
+        "wrist_weight_statistics": {
+            side: {
+                **{key: value for key, value in stats.items() if not key.endswith("_sum")},
+                "mean_hand_weight": round(stats["hand_weight_sum"] / max(1, stats["sampled_vertices"]), 4),
+                "mean_lower_arm_weight": round(stats["lower_arm_weight_sum"] / max(1, stats["sampled_vertices"]), 4),
+            }
+            for side, stats in wrist_stats.items()
+        },
         "upper_region_min_height_ratio": round((upper_limit - zmin) / height, 4),
         "torso_arm_plane_half_width_height_ratio": round(arm_plane / height, 4),
         "shoulder_weights_preserved": True,
@@ -814,7 +1024,58 @@ def ensure_complete_vertex_weights():
     }
 
 
+def coincident_vertex_groups(obj):
+    """Group seam duplicates without modifying the source topology."""
+    tolerance = max(height * 1e-6, 1e-9)
+    tree = KDTree(len(obj.data.vertices))
+    positions = [obj.matrix_world @ vertex.co for vertex in obj.data.vertices]
+    for index, point in enumerate(positions):
+        tree.insert(point, index)
+    tree.balance()
+    assigned = set()
+    groups = []
+    for index, point in enumerate(positions):
+        if index in assigned:
+            continue
+        group = sorted(i for _p, i, _d in tree.find_range(point, tolerance) if i not in assigned)
+        assigned.update(group)
+        if len(group) > 1:
+            groups.append(group)
+    return groups
+
+
+seam_groups = {obj.name: coincident_vertex_groups(obj) for obj in meshes}
+
+
+def synchronize_seam_weights():
+    """Keep duplicated UV/normal seam vertices moving together."""
+    changed = 0
+    for obj in meshes:
+        for indices in seam_groups[obj.name]:
+            weights = {}
+            for index in indices:
+                for element in obj.data.vertices[index].groups:
+                    weights[element.group] = weights.get(element.group, 0.0) + element.weight
+            total = sum(weights.values())
+            if total <= 1e-10:
+                continue
+            normalized = {index: value / total for index, value in weights.items() if value > 0}
+            for index in indices:
+                vertex = obj.data.vertices[index]
+                original = {item.group: item.weight for item in vertex.groups}
+                if any(abs(original.get(group, 0) - value) > 1e-6 for group, value in normalized.items()):
+                    changed += 1
+                for group in original:
+                    obj.vertex_groups[group].remove([index])
+                for group, value in normalized.items():
+                    obj.vertex_groups[group].add([index], value, 'REPLACE')
+    return {"method": "coincident_seam_weights_v1", "group_count": sum(map(len, seam_groups.values())),
+            "changed_vertex_count": changed, "tolerance": max(height * 1e-6, 1e-9)}
+
+
 weight_coverage = ensure_complete_vertex_weights()
+seam_weight_repair = synchronize_seam_weights()
+
 
 
 def evaluate_pose_stress():
@@ -831,10 +1092,15 @@ def evaluate_pose_stress():
 
     pose_specs = []
     for name in arm_obj.pose.bones.keys():
-        if name.endswith(("Shoulder", "UpperArm", "LowerArm", "UpperLeg", "LowerLeg")):
+        if name.endswith(("Shoulder", "UpperArm", "LowerArm", "Hand", "UpperLeg", "LowerLeg", "Foot", "Toes")):
             # Probe each local rotation axis in both directions. This is a
             # structural stress test, not a claim that every pose is natural.
-            angle = math.radians(35 if name.endswith(("Shoulder", "UpperArm", "UpperLeg")) else 55)
+            angle = math.radians(
+                35 if name.endswith(("Shoulder", "UpperArm", "UpperLeg"))
+                else 30 if name.endswith("Hand")
+                else 25 if name.endswith(("Foot", "Toes"))
+                else 55
+            )
             for axis in range(3):
                 for sign in (-1, 1):
                     pose_specs.append((name, axis, sign * angle))
@@ -849,16 +1115,26 @@ def evaluate_pose_stress():
         bpy.context.view_layer.update()
         depsgraph = bpy.context.evaluated_depsgraph_get()
         ratios = []
+        affected_ratios = []
+        seam_gap = 0.0
         for obj, edges, baseline in rest_edges:
             evaluated = obj.evaluated_get(depsgraph)
             mesh = evaluated.to_mesh()
             current = [evaluated.matrix_world @ vertex.co for vertex in mesh.vertices]
+            for indices in seam_groups[obj.name]:
+                anchor = indices[0]
+                for index in indices[1:]:
+                    gap_growth = (current[index] - current[anchor]).length - (baseline[index] - baseline[anchor]).length
+                    seam_gap = max(seam_gap, gap_growth)
             for first, second in edges:
                 old_length = (baseline[first] - baseline[second]).length
                 if old_length <= height * 1e-7:
                     continue
                 new_length = (current[first] - current[second]).length
-                ratios.append(new_length / old_length)
+                ratio = new_length / old_length
+                ratios.append(ratio)
+                if max((current[first] - baseline[first]).length, (current[second] - baseline[second]).length) > height * 1e-5:
+                    affected_ratios.append(ratio)
             evaluated.to_mesh_clear()
         pose_bone.rotation_euler = (0.0, 0.0, 0.0)
         if ratios:
@@ -867,6 +1143,7 @@ def evaluate_pose_stress():
             p95 = ratios[min(len(ratios) - 1, int((len(ratios) - 1) * 0.95))]
             p99 = ratios[min(len(ratios) - 1, int((len(ratios) - 1) * 0.99))]
             severe_fraction = severe / len(ratios)
+            affected_severe = sum(value < 0.65 or value > 1.55 for value in affected_ratios) / max(1, len(affected_ratios))
             results.append({
                 "bone": bone_name,
                 "axis": "XYZ"[axis],
@@ -874,18 +1151,25 @@ def evaluate_pose_stress():
                 "edge_ratio_p95": round(p95, 3),
                 "edge_ratio_p99": round(p99, 3),
                 "severe_edge_fraction": round(severe_fraction, 5),
-                "passed": severe_fraction <= 0.02 and p99 <= 3.0,
+                "affected_edge_count": len(affected_ratios),
+                "affected_severe_edge_fraction": round(affected_severe, 5),
+                "seam_gap_growth_height_ratio": round(seam_gap / height, 7),
+                "passed": severe_fraction <= 0.02 and p99 <= 3.0 and affected_severe <= 0.10 and seam_gap <= height * 1e-4,
             })
     bpy.context.view_layer.update()
     failed = [item for item in results if not item["passed"]]
     return {
-        "method": "blender_pose_edge_stress_v1",
+        "method": "blender_pose_edge_seam_stress_v4_limbs",
+        "seam_group_count": sum(map(len, seam_groups.values())),
+        "limitations": ["No detecta penetraciones entre superficies ni separación entre objetos distintos.",
+                        "Las uniones medidas son vértices coincidentes en reposo; no equivalen a una revisión visual.",
+                        "La prueba de muñeca rota el hueso Hand en tres ejes; no valida por sí sola la ubicación anatómica del pivote."],
         "pose_count": len(results),
         "passed": bool(results) and not failed,
         "failed_pose_count": len(failed),
         "poses": results,
         "warnings": [
-            f"La prueba de deformación detectó estiramiento anómalo en {len(failed)} de {len(results)} poses; revisa pesos/huesos: "
+            f"La prueba detectó deformación anómala o apertura de costuras en {len(failed)} de {len(results)} poses; revisa pesos/huesos: "
             + ", ".join(f"{item['bone']} {item['axis']} {item['degrees']}°" for item in failed[:8])
             + ("…" if len(failed) > 8 else "")
         ] if failed else [],
@@ -903,19 +1187,31 @@ if "FINISHED" not in result:
 ratio = maxs[side_index] - mins[side_index]
 depth = maxs[forward_index] - mins[forward_index]
 shape_ok = 0.16 <= ratio / height <= 0.95 and 0.06 <= depth / height <= 0.75
+hand_geometry_ok = bool(hand_finger_separation) and all(
+    item.get("confidence") != "low" for item in hand_finger_separation.values()
+)
+wrist_geometry_ok = all(
+    values.get("sampled_vertices", 0) >= 12
+    for values in weight_constraints.get("wrist_weight_statistics", {}).values()
+)
 report = {
     "algorithm": "silhouette_proportions_v2",
     "weighting": weights_method,
     "hand_bone_layout": "connected_arm_surface_v3",
     "hand_finger_layout_by_side": hand_finger_layout_by_side,
     "arm_component_vertex_count": arm_component_sizes,
+    "hand_landmark_diagnostics": hand_landmark_diagnostics,
+    "leg_landmark_diagnostics": leg_landmark_diagnostics,
     "hand_finger_track_detection": hand_finger_track_counts,
+    "hand_finger_separation": hand_finger_separation,
+    "thumb_layout_method": "palm_local_measured_finger_scale_v2",
     "forward_axis": input_forward_axis,
     "normalized_forward_axis": "-Y",
-    "confidence": "medium" if shape_ok and weights_method in {"blender_automatic_weights", "blender_automatic_weights_welded_proxy"} and deformation_validation["passed"] and weight_coverage["repaired_vertex_count"] == 0 else "low",
+    "confidence": "medium" if shape_ok and hand_geometry_ok and wrist_geometry_ok and weights_method in {"blender_automatic_weights", "blender_automatic_weights_welded_proxy"} and deformation_validation["passed"] and weight_coverage["repaired_vertex_count"] == 0 else "low",
     "deformation_validation": deformation_validation,
     "weight_constraints": weight_constraints,
     "weight_coverage": weight_coverage,
+    "seam_weight_repair": seam_weight_repair,
     "weight_proxy": weight_proxy_stats,
     "height": round(height, 5),
     "mesh_count": len(meshes),
@@ -938,6 +1234,14 @@ if not shape_ok:
     report["warnings"].append("Las proporciones están fuera del rango humanoide heurístico; la confianza del auto-rig es baja.")
 if any(layout != "mesh_point_cloud" for layout in hand_finger_layout_by_side.values()):
     report["warnings"].append("No se pudo detectar una isla conectada por brazo para ajustar los dedos; se usó la disposición proporcional de respaldo.")
+if any(item.get("confidence") == "low" for item in hand_finger_separation.values()):
+    report["warnings"].append("La geometría de una o ambas manos no muestra valles claros entre dedos; las cuatro cadenas son propuestas y requieren inspección ortográfica y ajuste manual.")
+    report["warnings"].append("El orden índice-meñique se asigna por cuantiles de profundidad descendentes según la inspección de Meido; revísalo en cada modelo antes de usar gestos de mano.")
+    report["warnings"].append("La confianza global se redujo porque la detección de dedos no pudo confirmar regiones anatómicas separadas.")
+if not wrist_geometry_ok:
+    report["warnings"].append("La geometría no aportó suficientes vértices cerca de una o ambas muñecas; verifica manualmente los pesos de palma y antebrazo.")
+if any("ambiguous_cross_section" in item.get("method", "") for item in hand_landmark_diagnostics.values()):
+    report["warnings"].append("La sección geométrica de la muñeca no fue concluyente; el pivote usa el percentil 65 del brazo conectado y requiere comprobación visual contra el puño de la manga.")
 report["warnings"].extend(deformation_validation["warnings"])
 if weight_coverage["repaired_vertex_count"]:
     report["warnings"].append(

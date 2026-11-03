@@ -227,6 +227,7 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
         raise ProjectError("El avatar no pasó la validación: " + " ".join(info["errors"]))
     project_file = Path(project_path).expanduser().resolve()
     data = load_project(project_file)
+    previous_avatar = data.get("avatar3d", {})
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", source.stem).strip("-").lower() or "avatar"
     relative = Path("assets") / "avatars" / f"{slug}-{info['sha256'][:10]}{suffix}"
     destination = project_file.parent / relative
@@ -239,13 +240,33 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
             temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)
-    data["avatar3d"] = {
+    avatar_metadata = {
         "format": resource_format, "version": version, "path": relative.as_posix(),
         "sha256": info["sha256"], "name": info["name"],
         "rigged": info.get("rigged", True), "human_bones": info["human_bones"],
         "animations": info["animations"],
         **(extra_metadata or {}),
     }
+    paths_to_prune: list[dict[str, str]] = []
+    incoming_source_hash = avatar_metadata.get("source_sha256")
+    same_lineage = (
+        isinstance(previous_avatar, dict)
+        and previous_avatar.get("rigged")
+        and incoming_source_hash
+        and previous_avatar.get("source_sha256") == incoming_source_hash
+    )
+    if same_lineage:
+        previous_versions = previous_avatar.get("versions", [])
+        if not isinstance(previous_versions, list):
+            previous_versions = []
+        current_version = {key: value for key, value in previous_avatar.items() if key != "versions"}
+        history = []
+        if current_version.get("path") != relative.as_posix():
+            history.append(current_version)
+        history.extend(item for item in previous_versions if isinstance(item, dict) and item.get("path") != relative.as_posix())
+        avatar_metadata["versions"] = history[:2]
+        paths_to_prune = [item for item in history[2:] if item.get("path") and item.get("sha256")]
+    data["avatar3d"] = avatar_metadata
     data["status"] = "needs_review"
     data["stage"] = "avatar3d"
     warning_summary = " ".join(info["warnings"])
@@ -256,6 +277,21 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
         if created_resource and destination.exists():
             destination.unlink()
         raise
+    # Only prune files explicitly recorded as older versions of this same
+    # source lineage. Keep source_path and never scan/delete arbitrary assets.
+    source_relative = avatar_metadata.get("source_path")
+    for old in paths_to_prune:
+        try:
+            old_relative = Path(str(old["path"]))
+            if old_relative.is_absolute() or ".." in old_relative.parts or old_relative == Path(str(source_relative or "")):
+                continue
+            old_path = (project_file.parent / old_relative).resolve()
+            avatar_folder = (project_file.parent / "assets" / "avatars").resolve()
+            old_path.relative_to(avatar_folder)
+            if old_path.is_file() and hashlib.sha256(old_path.read_bytes()).hexdigest() == old["sha256"]:
+                old_path.unlink()
+        except (OSError, ValueError):
+            continue
     return {"project": str(project_file), "avatar": data["avatar3d"], "validation": info}
 
 
