@@ -47,6 +47,12 @@ let handSegmentationCapture = null;
 let handMappingReports = [];
 const handSegmentationRaycaster = new THREE.Raycaster();
 const handSegmentationNdc = new THREE.Vector2();
+const pivotDragRaycaster = new THREE.Raycaster();
+const pivotDragNdc = new THREE.Vector2();
+let bonePivotDragEnabled = false;
+let bonePivotAxisConstraint = 'view';
+let activeBonePivotDrag = null;
+const bonePivotEdits = [];
 function paintHandWeights(event) {
   if (!handWeightPaint.enabled || !avatarRoot) return;
   const rect = renderer.domElement.getBoundingClientRect();
@@ -58,28 +64,47 @@ function paintHandWeights(event) {
   if (!indices || !weights) return;
   const boneIndex = mesh.skeleton.bones.findIndex((bone) => bone.name === handWeightPaint.boneName);
   if (boneIndex < 0) { showStatus(avatarDisplayName, 'La malla no contiene el hueso seleccionado.'); return; }
-  const worldHit = hit.point.clone(), radiusSq = handWeightPaint.radius ** 2;
+  const modelHeight = new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y;
+  const radius = Math.max(0.001, modelHeight * handWeightPaint.radiusRatio);
+  const radiusSq = radius * radius, worldHit = hit.point.clone();
   const undo = handPaintStroke.get(mesh) || new Map(), vertex = new THREE.Vector3();
   handPaintStroke.set(mesh, undo);
+  let selected = handPaintSelection.get(mesh);
+  if (!selected) { selected = new Set(); handPaintSelection.set(mesh, selected); }
+  let selectedCount = 0;
   for (let i = 0; i < geo.attributes.position.count; i++) {
     mesh.getVertexPosition(i, vertex); mesh.localToWorld(vertex);
-    if (vertex.distanceToSquared(worldHit) > radiusSq) continue;
+    const distanceSq = vertex.distanceToSquared(worldHit);
+    if (distanceSq > radiusSq) continue;
     const oldIndices = [0,1,2,3].map((slot) => indices.getComponent(i, slot));
     const oldWeights = [0,1,2,3].map((slot) => weights.getComponent(i, slot));
     if (!oldWeights.some((weight) => weight > 0)) continue;
-    if (!undo.has(i)) undo.set(i, { indices: oldIndices, weights: oldWeights });
+    selected.add(i); selectedCount++;
     const influence = new Map();
     oldIndices.forEach((index, slot) => influence.set(index, (influence.get(index) || 0) + oldWeights[slot]));
-    const previous = influence.get(boneIndex) || 0, target = previous + (1 - previous) * handWeightPaint.strength;
+    const previous = influence.get(boneIndex) || 0;
+    const distance = Math.sqrt(distanceSq) / radius;
+    const falloff = 1 - THREE.MathUtils.smoothstep(distance, 0.45, 1);
+    const target = previous + (1 - previous) * handWeightPaint.strength * falloff;
+    if (target <= previous + 1e-5) continue;
+    if (!undo.has(i)) undo.set(i, { indices: oldIndices, weights: oldWeights });
     for (const [index, weight] of influence) influence.set(index, index === boneIndex ? target : weight * (1 - target) / Math.max(1e-8, 1 - previous));
     influence.set(boneIndex, target);
     const chosen = [...influence.entries()].filter(([, weight]) => weight > 1e-5).sort((a,b) => b[1]-a[1]).slice(0,4);
     const total = chosen.reduce((sum, item) => sum + item[1], 0) || 1;
     for (let slot = 0; slot < 4; slot++) { indices.setComponent(i, slot, chosen[slot]?.[0] ?? boneIndex); weights.setComponent(i, slot, chosen[slot] ? chosen[slot][1] / total : 0); }
   }
-  if (!undo.size) return;
-  indices.needsUpdate = true; weights.needsUpdate = true;
-  buildHandWeightDiagnostic(); showStatus(avatarDisplayName, `Pesos ajustados en ${undo.size} vértices · guarda para conservar la versión`); event.preventDefault();
+  if (undo.size) {
+    indices.needsUpdate = true; weights.needsUpdate = true;
+    buildHandWeightDiagnostic();
+  }
+  if (selectedCount) rebuildHandPaintSelectionOverlay();
+  if (!undo.size) {
+    if (selectedCount) showStatus(avatarDisplayName, `${selectedCount} vértices dentro del pincel · marca verde · sin cambio de peso apreciable.`);
+    return;
+  }
+  showStatus(avatarDisplayName, `Pincel ${handWeightPaint.boneName} · ${selectedCount} vértices tocados, resaltados en verde · radio ${(handWeightPaint.radiusRatio * 100).toFixed(1)}% de la altura · deshaz si hace falta.`);
+  event.preventDefault();
 }
 function requestHandSegmentation(event) {
   if (handSegmentationPending) { showStatus(avatarDisplayName, 'SAM 2 aún está procesando el punto anterior.'); return; }
@@ -328,14 +353,262 @@ function applyHandSegmentationProposal() {
   return { changed, cleaned, message };
 }
 
+function configureBonePivotDrag(enabled) {
+  if (enabled && manualBoneRotations.size) {
+    return { enabled: false, message: 'Restaura los giros manuales antes de arrastrar pivotes.' };
+  }
+  bonePivotDragEnabled = Boolean(enabled);
+  if (bonePivotDragEnabled) {
+    handWeightPaint.enabled = false;
+    handSegmentation.enabled = false;
+    discardSelectedBonePivotProposal();
+    activeAction?.stop(); activeAction = null; manualPoseMode = true; clearProceduralOffsets(); restoreRestPose();
+  }
+  const message = bonePivotDragEnabled
+    ? 'Arrastre de pivote activo · selecciona un hueso y arrastra su punto amarillo. Pulsa de nuevo para salir.'
+    : 'Arrastre de pivote desactivado.';
+  showStatus(avatarDisplayName, message);
+  return { enabled: bonePivotDragEnabled, message };
+}
+
+function configureBonePivotAxis(axis = 'view') {
+  const allowed = new Set(['view', 'x', 'y', 'z']);
+  bonePivotAxisConstraint = allowed.has(String(axis).toLowerCase()) ? String(axis).toLowerCase() : 'view';
+  return { axis: bonePivotAxisConstraint };
+}
+
+function nearestDescendantBones(bone) {
+  const found = [];
+  const visit = (node) => {
+    for (const child of node.children) {
+      if (child.isBone) found.push(child);
+      else visit(child);
+    }
+  };
+  visit(bone);
+  return found;
+}
+
+function vectorMapValue(map, name) {
+  const value = map.get(name);
+  return value ? new THREE.Vector3(...value) : new THREE.Vector3();
+}
+
+function captureBonePivotAction(bone, children = nearestDescendantBones(bone)) {
+  const affected = [bone, ...children];
+  const skeletons = new Set();
+  avatarRoot?.traverse((node) => { if (node.isSkinnedMesh && node.skeleton) skeletons.add(node.skeleton); });
+  const names = affected.map((node) => node.name);
+  return {
+    positions: new Map(affected.map((node) => [node, node.position.clone()])),
+    restPositions: new Map(affected.map((node) => [node, boneRestPositions.get(node)?.clone() || node.position.clone()])),
+    positionOffsets: new Map(names.map((name) => [name, manualBonePositions.has(name) ? [...manualBonePositions.get(name)] : null])),
+    pivotCompensations: new Map(names.map((name) => [name, bonePivotCompensations.has(name) ? [...bonePivotCompensations.get(name)] : null])),
+    inverses: new Map([...skeletons].map((skeleton) => [skeleton, skeleton.boneInverses.map((matrix) => matrix.clone())])),
+    worlds: new Map([...skeletons].map((skeleton) => [skeleton, skeleton.bones.map((node) => node.matrixWorld.clone())])),
+    skeletons,
+    childWorldPositions: new Map(children.map((child) => [child, child.getWorldPosition(new THREE.Vector3())])),
+    startWorld: bone.getWorldPosition(new THREE.Vector3()),
+    children,
+  };
+}
+
+function restoreNamedMap(map, snapshots) {
+  for (const [name, value] of snapshots || []) {
+    if (value == null) map.delete(name);
+    else map.set(name, [...value]);
+  }
+}
+
+function boneWorldSegment(bone) {
+  if (!bone) return null;
+  const start = bone.getWorldPosition(new THREE.Vector3());
+  const child = bone.children.find((node) => node.isBone);
+  const end = child ? child.getWorldPosition(new THREE.Vector3()) : start.clone();
+  const direction = end.sub(start);
+  return { start, direction, lengthSq: direction.lengthSq() };
+}
+
+function distanceToBoneSegmentSq(point, segment) {
+  const delta = point.clone().sub(segment.start);
+  const along = segment.lengthSq > 1e-10 ? THREE.MathUtils.clamp(delta.dot(segment.direction) / segment.lengthSq, 0, 1) : 0;
+  return point.distanceToSquared(segment.start.clone().addScaledVector(segment.direction, along));
+}
+
+function nearestBoneSegment(point, bones, excludedBone = null) {
+  let nearest = null;
+  for (const item of bones) {
+    const bone = item.bone || item;
+    if (bone === excludedBone) continue;
+    const segment = item.segment || boneWorldSegment(bone);
+    if (!segment || segment.lengthSq < 1e-10) continue;
+    const distanceSq = distanceToBoneSegmentSq(point, segment);
+    if (!nearest || distanceSq < nearest.distanceSq) nearest = { bone, segment, distanceSq };
+  }
+  return nearest;
+}
+
+function updatePivotOffsets(bone, children) {
+  const rest = boneRestPositions.get(bone) || bone.position;
+  const compensation = vectorMapValue(bonePivotCompensations, bone.name);
+  const manual = bone.position.clone().sub(rest).sub(compensation);
+  if (manual.lengthSq() < 1e-12) manualBonePositions.delete(bone.name);
+  else manualBonePositions.set(bone.name, manual.toArray());
+  for (const child of children) {
+    const childRest = boneRestPositions.get(child) || child.position;
+    const childManual = vectorMapValue(manualBonePositions, child.name);
+    const childCompensation = child.position.clone().sub(childRest).sub(childManual);
+    if (childCompensation.lengthSq() < 1e-12) bonePivotCompensations.delete(child.name);
+    else bonePivotCompensations.set(child.name, childCompensation.toArray());
+  }
+}
+
+function moveBonePivotToWorld(bone, targetWorld, { method = 'manual_pivot_edit', coalesce = false } = {}) {
+  if (!bone?.parent || !avatarRoot) return { moved: false, message: 'El hueso seleccionado no tiene un pivote editable.' };
+  avatarRoot.updateMatrixWorld(true);
+  if (bone.getWorldPosition(new THREE.Vector3()).distanceTo(targetWorld) < 1e-9) return { moved: false, message: `El pivote ${bone.name} ya está en esa posición.` };
+  const action = captureBonePivotAction(bone);
+  bone.position.copy(bone.parent.worldToLocal(targetWorld.clone()));
+  avatarRoot.updateMatrixWorld(true);
+  for (const [child, worldPosition] of action.childWorldPositions) {
+    if (child.parent) child.position.copy(child.parent.worldToLocal(worldPosition.clone()));
+  }
+  avatarRoot.updateMatrixWorld(true);
+  for (const skeleton of action.skeletons) {
+    preserveBindTransforms(skeleton, action.worlds.get(skeleton), action.inverses.get(skeleton));
+  }
+  updatePivotOffsets(bone, action.children);
+  const pivotEdit = {
+    bone: bone.name, method, start_world: action.startWorld.toArray(),
+    end_world: targetWorld.toArray(), confidence: 'user_review',
+  };
+  action.pivotEdit = pivotEdit;
+  action.kind = coalesce ? 'bone_position_control' : 'bone_pivot';
+  action.boneName = bone.name;
+  const last = handBoneUndo[handBoneUndo.length - 1];
+  if (coalesce && last?.kind === action.kind && last.boneName === bone.name) {
+    last.pivotEdit.end_world = [...pivotEdit.end_world];
+  } else {
+    handBoneUndo.push(action);
+    bonePivotEdits.push(pivotEdit);
+  }
+  return { moved: true, action, message: `Se movió ${bone.name} y se mantuvieron ancladas sus articulaciones descendientes.` };
+}
+
+function beginBonePivotDrag(event) {
+  if (!bonePivotDragEnabled || !selectedBoneMarker?.visible || activeBonePivotDrag || !avatarRoot) return false;
+  const bone = findBone(selectedBoneName);
+  if (!bone || !bone.parent) return false;
+  avatarRoot.updateMatrixWorld(true);
+  bone.getWorldPosition(selectedBoneMarker.position);
+  const rect = renderer.domElement.getBoundingClientRect();
+  const projected = selectedBoneMarker.position.clone().project(camera);
+  const markerX = rect.left + (projected.x * 0.5 + 0.5) * rect.width;
+  const markerY = rect.top + (0.5 - projected.y * 0.5) * rect.height;
+  if ((event.clientX - markerX) ** 2 + (event.clientY - markerY) ** 2 > 26 ** 2) return false;
+  const normal = camera.getWorldDirection(new THREE.Vector3()).normalize();
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, selectedBoneMarker.position);
+  pivotDragNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+  pivotDragRaycaster.setFromCamera(pivotDragNdc, camera);
+  const startWorld = new THREE.Vector3();
+  if (!pivotDragRaycaster.ray.intersectPlane(plane, startWorld)) return false;
+  const pivotSnapshot = captureBonePivotAction(bone);
+  activeBonePivotDrag = {
+    ...pivotSnapshot, bone, plane, pointerStartWorld: startWorld.clone(),
+    pointerOffset: pivotSnapshot.startWorld.clone().sub(startWorld), moved: false,
+  };
+  controls.enabled = false;
+  renderer.domElement.setPointerCapture?.(event.pointerId);
+  event.preventDefault();
+  return true;
+}
+
+function updateBonePivotDrag(event) {
+  if (!activeBonePivotDrag) return false;
+  const rect = renderer.domElement.getBoundingClientRect();
+  pivotDragNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+  pivotDragRaycaster.setFromCamera(pivotDragNdc, camera);
+  const target = new THREE.Vector3();
+  if (!pivotDragRaycaster.ray.intersectPlane(activeBonePivotDrag.plane, target)) return true;
+  let worldTarget = target.clone().add(activeBonePivotDrag.pointerOffset);
+  if (bonePivotAxisConstraint !== 'view') {
+    const axis = new THREE.Vector3(
+      bonePivotAxisConstraint === 'x' ? 1 : 0,
+      bonePivotAxisConstraint === 'y' ? 1 : 0,
+      bonePivotAxisConstraint === 'z' ? 1 : 0,
+    );
+    const normal = activeBonePivotDrag.plane.normal;
+    const projectedAxis = axis.clone().addScaledVector(normal, -axis.dot(normal));
+    if (projectedAxis.lengthSq() < 1e-6) {
+      showStatus(avatarDisplayName, `El eje ${bonePivotAxisConstraint.toUpperCase()} apunta hacia la cámara; cambia a otra vista para arrastrarlo.`);
+      return true;
+    }
+    const cursorDelta = target.sub(activeBonePivotDrag.pointerStartWorld);
+    const amount = cursorDelta.dot(projectedAxis) / projectedAxis.lengthSq();
+    worldTarget = activeBonePivotDrag.startWorld.clone().addScaledVector(axis, amount);
+  }
+  activeBonePivotDrag.bone.position.copy(activeBonePivotDrag.bone.parent.worldToLocal(worldTarget));
+  avatarRoot.updateMatrixWorld(true);
+  // A bone's local translation normally carries its entire subtree. Keep the
+  // nearest child joints anchored in world space so this edits one pivot only.
+  for (const [child, childWorld] of activeBonePivotDrag.childWorldPositions) {
+    if (child.parent) child.position.copy(child.parent.worldToLocal(childWorld.clone()));
+  }
+  avatarRoot.updateMatrixWorld(true);
+  for (const skeleton of activeBonePivotDrag.skeletons) {
+    preserveBindTransforms(skeleton, activeBonePivotDrag.worlds.get(skeleton), activeBonePivotDrag.inverses.get(skeleton));
+  }
+  activeBonePivotDrag.moved = activeBonePivotDrag.bone.position.distanceTo(activeBonePivotDrag.positions.get(activeBonePivotDrag.bone)) > 1e-6;
+  event.preventDefault();
+  return true;
+}
+
+function finishBonePivotDrag() {
+  const drag = activeBonePivotDrag;
+  if (!drag) return false;
+  activeBonePivotDrag = null;
+  controls.enabled = true;
+  if (!drag.moved) {
+    for (const [bone, position] of drag.positions) bone.position.copy(position);
+    restoreNamedMap(manualBonePositions, drag.positionOffsets);
+    restoreNamedMap(bonePivotCompensations, drag.pivotCompensations);
+    for (const [skeleton, inverses] of drag.inverses) {
+      skeleton.boneInverses = inverses.map((matrix) => matrix.clone());
+      skeleton.update();
+    }
+    avatarRoot.updateMatrixWorld(true);
+    return false;
+  }
+  avatarRoot.updateMatrixWorld(true);
+  for (const skeleton of drag.skeletons) preserveBindTransforms(skeleton, drag.worlds.get(skeleton), drag.inverses.get(skeleton));
+  updatePivotOffsets(drag.bone, drag.children);
+  const end = drag.bone.getWorldPosition(new THREE.Vector3()).toArray();
+  const pivotEdit = { bone: drag.bone.name, method: 'manual_view_drag_camera_plane', start_world: drag.startWorld.toArray(), end_world: end, confidence: 'user_review' };
+  drag.pivotEdit = pivotEdit;
+  drag.kind = 'bone_pivot';
+  drag.boneName = drag.bone.name;
+  handBoneUndo.push(drag);
+  bonePivotEdits.push(pivotEdit);
+  showStatus(avatarDisplayName, `Pivote ${drag.bone.name} movido sin desplazar sus articulaciones hijas. La pose neutral se conservó; puedes deshacer o guardar.`);
+  return true;
+}
+
 renderer.domElement.addEventListener('pointerdown', (event) => {
   if (event.button !== 0) return;
+  if (beginBonePivotDrag(event)) return;
   if (handSegmentation.enabled) { requestHandSegmentation(event); return; }
   if (!handWeightPaint.enabled) return;
   handPaintPointerDown = true; handPaintStroke = new Map(); controls.enabled = false; paintHandWeights(event);
 });
-renderer.domElement.addEventListener('pointermove', (event) => { if (handPaintPointerDown) paintHandWeights(event); });
-window.addEventListener('pointerup', () => { if (handPaintPointerDown) { if ([...handPaintStroke.values()].some((undo) => undo.size)) handWeightUndo.push(handPaintStroke); handPaintPointerDown = false; handPaintStroke = null; controls.enabled = true; } });
+renderer.domElement.addEventListener('pointermove', (event) => { if (activeBonePivotDrag) updateBonePivotDrag(event); else if (handPaintPointerDown) paintHandWeights(event); });
+window.addEventListener('pointerup', () => {
+  finishBonePivotDrag();
+  if (handPaintPointerDown) { if ([...handPaintStroke.values()].some((undo) => undo.size)) handWeightUndo.push(handPaintStroke); handPaintPointerDown = false; handPaintStroke = null; controls.enabled = true; }
+});
+window.addEventListener('pointercancel', () => {
+  finishBonePivotDrag();
+  if (handPaintPointerDown) { handPaintPointerDown = false; handPaintStroke = null; controls.enabled = true; }
+});
 
 const gltfLoader = new GLTFLoader();
 gltfLoader.register((parser) => new VRMLoaderPlugin(parser));
@@ -346,12 +619,18 @@ let autoRigBones = [];
 let hostBridge = null;
 let skeletonHelper = null;
 let selectedBoneMarker = null;
+let bonePivotProposalMarker = null;
+let pendingBonePivotProposal = null;
 let handDiagnosticGroup = null;
+let boneLandmarkDiagnostics = {};
 let handWeightDiagnostic = null;
 let handDiagnosticsVisible = false;
 let handWeightsVisible = false;
 const handWeightSources = [];
-let handWeightPaint = { enabled: false, boneName: '', radius: 0.025, strength: 0.55 };
+let handWeightPaint = { enabled: false, boneName: '', radiusRatio: 0.012, strength: 0.25 };
+const handPaintSelection = new Map();
+let handPaintSelectionGroup = null;
+let handPaintSelectionSources = [];
 let handWeightUndo = [];
 let handBoneUndo = [];
 let handPaintPointerDown = false;
@@ -362,8 +641,11 @@ let manualPoseMode = false;
 let operationBusy = false;
 const boneRestQuaternions = new Map();
 const boneRestPositions = new Map();
+const boneOriginalRestPositions = new Map();
+const boneRestInverses = new Map();
 const manualBoneRotations = new Map();
 const manualBonePositions = new Map();
+const bonePivotCompensations = new Map();
 let avatarDisplayName = 'Avatar 3D';
 let modelLoadState = 'idle';
 let modelLoadError = '';
@@ -464,17 +746,45 @@ function clearProceduralOffsets() {
       const manual = manualBoneRotations.get(node.name);
       if (manual) node.quaternion.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(...manual, 'XYZ')));
       const position = boneRestPositions.get(node);
-      if (position) node.position.copy(position).add(new THREE.Vector3(...(manualBonePositions.get(node.name) || [0, 0, 0])));
+      if (position) node.position.copy(position)
+        .add(vectorMapValue(manualBonePositions, node.name))
+        .add(vectorMapValue(bonePivotCompensations, node.name));
     }
   }
   proceduralOffsets.clear();
 }
 
 function refreshBoneData() {
-  boneRestQuaternions.clear();
-  boneRestPositions.clear();
-  autoRigBones = [];
-  avatarRoot?.traverse((node) => { if (node.isBone) { boneRestQuaternions.set(node, node.quaternion.clone()); boneRestPositions.set(node, node.position.clone()); autoRigBones.push(node); } });
+  if (activeBonePivotDrag) {
+    activeBonePivotDrag = null;
+    controls.enabled = true;
+  }
+  bonePivotDragEnabled = false;
+  discardSelectedBonePivotProposal();
+  const detectedBones = [];
+  avatarRoot?.traverse((node) => { if (node.isBone) detectedBones.push(node); });
+  const sameRig = detectedBones.length === autoRigBones.length && detectedBones.every((node) => boneRestQuaternions.has(node));
+  if (!sameRig) {
+    clearHandPaintSelection();
+    boneRestQuaternions.clear();
+    boneRestPositions.clear();
+    boneOriginalRestPositions.clear();
+    boneRestInverses.clear();
+    manualBoneRotations.clear();
+    manualBonePositions.clear();
+    bonePivotCompensations.clear();
+    handBoneUndo = [];
+    bonePivotEdits.length = 0;
+    for (const node of detectedBones) {
+      boneRestQuaternions.set(node, node.quaternion.clone());
+      boneRestPositions.set(node, node.position.clone());
+      boneOriginalRestPositions.set(node, node.position.clone());
+    }
+    const skeletons = new Set();
+    avatarRoot?.traverse((node) => { if (node.isSkinnedMesh && node.skeleton) skeletons.add(node.skeleton); });
+    for (const skeleton of skeletons) boneRestInverses.set(skeleton, skeleton.boneInverses.map((matrix) => matrix.clone()));
+  }
+  autoRigBones = detectedBones;
   if (skeletonHelper) scene.remove(skeletonHelper);
   skeletonHelper = avatarRoot ? new THREE.SkeletonHelper(avatarRoot) : null;
   if (skeletonHelper) {
@@ -490,9 +800,11 @@ function refreshBoneData() {
       : name === 'head' || name === 'neck' || name === 'jaw' ? 0xc77dff : 0xff4f71;
   const markerSize = Math.max(0.0015, new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y * 0.0022);
   for (const bone of autoRigBones) {
+    const quality = boneLandmarkDiagnostics[bone.name]?.confidence;
+    const markerColor = quality === 'low' ? 0xff4f71 : quality === 'medium' ? 0xffc857 : regionColor(bone.name);
     const marker = new THREE.Mesh(
       new THREE.SphereGeometry(markerSize, 6, 4),
-      new THREE.MeshBasicMaterial({ color: regionColor(bone.name), depthTest: false, depthWrite: false }),
+      new THREE.MeshBasicMaterial({ color: markerColor, depthTest: false, depthWrite: false }),
     );
     marker.name = `RigM joint diagnostic · ${bone.name}`;
     marker.userData.bone = bone;
@@ -537,6 +849,14 @@ function setHandDiagnostics(visible) {
   return { visible: handDiagnosticsVisible, markers };
 }
 
+function setBoneLandmarkDiagnostics(diagnostics) {
+  boneLandmarkDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : {};
+  if (avatarRoot) refreshBoneData();
+  const low = Object.values(boneLandmarkDiagnostics).filter((item) => item?.confidence === 'low').length;
+  const medium = Object.values(boneLandmarkDiagnostics).filter((item) => item?.confidence === 'medium').length;
+  return { low_confidence_bones: low, medium_confidence_bones: medium };
+}
+
 function buildHandWeightDiagnostic(targetBone = selectedBoneName) {
   if (handWeightDiagnostic) {
     scene.remove(handWeightDiagnostic);
@@ -549,6 +869,8 @@ function buildHandWeightDiagnostic(targetBone = selectedBoneName) {
   handWeightSources.length = 0;
   handWeightDiagnostic = new THREE.Group();
   const cold = new THREE.Color('#29445c'), hot = new THREE.Color('#ff4f71');
+  const outside = new THREE.Color('#35d9e8');
+  const modelHeight = Math.max(new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y, 1e-4);
   const colors = [];
   avatarRoot?.traverse((mesh) => {
     if (!mesh.isSkinnedMesh || !mesh.geometry.attributes.skinIndex || !mesh.geometry.attributes.skinWeight) return;
@@ -556,7 +878,15 @@ function buildHandWeightDiagnostic(targetBone = selectedBoneName) {
     const indexAttr = mesh.geometry.attributes.skinIndex, weightAttr = mesh.geometry.attributes.skinWeight;
     const boneIndex = boneNames.indexOf(targetBone);
     if (boneIndex < 0) return;
-    const vertexIndices = [], boneColors = [];
+    const bone = mesh.skeleton.bones[boneIndex], selectedSegment = boneWorldSegment(bone);
+    const skeletonSegments = mesh.skeleton.bones
+      .filter((candidate) => candidate !== bone)
+      .map((candidate) => ({ bone: candidate, segment: boneWorldSegment(candidate) }))
+      .filter((item) => item.segment && item.segment.lengthSq >= 1e-10);
+    const cleanupRadius = selectedSegment?.lengthSq > 1e-10
+      ? Math.max(modelHeight * 0.035, Math.sqrt(selectedSegment.lengthSq) * 0.8) : 0;
+    const vertexIndices = [], boneColors = [], point = new THREE.Vector3();
+    let spillCount = 0;
     for (let vertex = 0; vertex < indexAttr.count; vertex++) {
       let influence = 0;
       for (let slot = 0; slot < 4; slot++) {
@@ -565,7 +895,13 @@ function buildHandWeightDiagnostic(targetBone = selectedBoneName) {
       }
       if (influence < 0.08) continue;
       vertexIndices.push(vertex);
-      const color = cold.clone().lerp(hot, Math.min(1, influence));
+      mesh.getVertexPosition(vertex, point); mesh.localToWorld(point);
+      const targetDistanceSq = selectedSegment ? distanceToBoneSegmentSq(point, selectedSegment) : 0;
+      const closest = selectedSegment && Math.sqrt(targetDistanceSq) > cleanupRadius
+        ? nearestBoneSegment(point, skeletonSegments, bone) : null;
+      const isOutside = Boolean(closest && Math.sqrt(closest.distanceSq) + modelHeight * 0.012 < Math.sqrt(targetDistanceSq));
+      if (isOutside) spillCount++;
+      const color = isOutside ? outside : cold.clone().lerp(hot, Math.min(1, influence));
       boneColors.push(color.r, color.g, color.b);
     }
     if (!vertexIndices.length) return;
@@ -573,13 +909,14 @@ function buildHandWeightDiagnostic(targetBone = selectedBoneName) {
     const positions = new Float32Array(vertexIndices.length * 3);
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
     geometry.setAttribute('color', new THREE.Float32BufferAttribute(boneColors, 3));
-    const points = new THREE.Points(geometry, new THREE.PointsMaterial({ size: 0.009, sizeAttenuation: true, vertexColors: true, depthTest: false, transparent: true, opacity: 0.96 }));
+    const points = new THREE.Points(geometry, new THREE.PointsMaterial({ size: 0.009, sizeAttenuation: true, vertexColors: true, depthTest: true, depthFunc: THREE.LessEqualDepth, depthWrite: false, transparent: true, opacity: 0.96 }));
     points.renderOrder = 13;
     handWeightDiagnostic.add(points);
-    handWeightSources.push({ mesh, vertexIndices, positions, geometry });
+    handWeightSources.push({ mesh, vertexIndices, positions, geometry, spillCount });
   });
   handWeightDiagnostic.visible = handWeightsVisible;
   scene.add(handWeightDiagnostic);
+  return { vertices: handWeightSources.reduce((total, source) => total + source.vertexIndices.length, 0), outside: handWeightSources.reduce((total, source) => total + source.spillCount, 0) };
 }
 
 function updateHandWeightDiagnostic() {
@@ -596,20 +933,95 @@ function updateHandWeightDiagnostic() {
   }
 }
 
+function clearHandPaintSelection() {
+  handPaintSelection.clear();
+  if (handPaintSelectionGroup) {
+    scene.remove(handPaintSelectionGroup);
+    handPaintSelectionGroup.traverse((node) => {
+      node.geometry?.dispose();
+      if (Array.isArray(node.material)) node.material.forEach((material) => material.dispose());
+      else node.material?.dispose();
+    });
+    handPaintSelectionGroup = null;
+  }
+  handPaintSelectionSources = [];
+  return true;
+}
+
+function rebuildHandPaintSelectionOverlay() {
+  if (handPaintSelectionGroup) {
+    scene.remove(handPaintSelectionGroup);
+    handPaintSelectionGroup.traverse((node) => {
+      node.geometry?.dispose();
+      if (Array.isArray(node.material)) node.material.forEach((material) => material.dispose());
+      else node.material?.dispose();
+    });
+  }
+  handPaintSelectionSources = [];
+  handPaintSelectionGroup = new THREE.Group();
+  handPaintSelectionGroup.name = 'RigM · pincel · vértices tocados';
+  const height = Math.max(new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y, 1e-4);
+  for (const [mesh, selected] of handPaintSelection) {
+    if (!selected.size) continue;
+    const vertices = [...selected], positions = new Float32Array(vertices.length * 3);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+    const points = new THREE.Points(geometry, new THREE.PointsMaterial({
+      color: 0xa8ff3f, size: Math.max(height * 0.010, 0.006), sizeAttenuation: true,
+      depthTest: true, depthFunc: THREE.LessEqualDepth, depthWrite: false, transparent: true, opacity: 1,
+    }));
+    points.renderOrder = 16;
+    handPaintSelectionGroup.add(points);
+    handPaintSelectionSources.push({ mesh, vertices, positions, geometry });
+  }
+  handPaintSelectionGroup.visible = handPaintSelectionSources.length > 0;
+  scene.add(handPaintSelectionGroup);
+  updateHandPaintSelectionOverlay();
+}
+
+function updateHandPaintSelectionOverlay() {
+  const point = new THREE.Vector3();
+  for (const source of handPaintSelectionSources) {
+    for (let i = 0; i < source.vertices.length; i++) {
+      source.mesh.getVertexPosition(source.vertices[i], point);
+      source.mesh.localToWorld(point);
+      source.positions[i * 3] = point.x;
+      source.positions[i * 3 + 1] = point.y;
+      source.positions[i * 3 + 2] = point.z;
+    }
+    source.geometry.attributes.position.needsUpdate = true;
+  }
+}
+
 function setHandWeightDiagnostics(visible, targetBone = selectedBoneName) {
   handWeightsVisible = Boolean(visible);
-  buildHandWeightDiagnostic(targetBone);
+  const diagnostic = buildHandWeightDiagnostic(targetBone);
   handWeightDiagnostic.visible = handWeightsVisible;
   showStatus(avatarDisplayName, handWeightsVisible
-    ? `Pesos de ${targetBone} · ${handWeightSources.reduce((n, source) => n + source.vertexIndices.length, 0)} vértices coloreados por influencia`
+    ? `Pesos de ${targetBone} · ${diagnostic.vertices} vértices · azul/rosa: influencia local baja/alta · cian: influencia lejos del segmento (${diagnostic.outside})`
     : 'Vista de pesos oculta');
   return { visible: handWeightsVisible, mesh_count: handWeightSources.length };
 }
 
-function configureHandWeightPaint(enabled, boneName = selectedBoneName) {
-  handWeightPaint = { ...handWeightPaint, enabled: Boolean(enabled), boneName: boneName || selectedBoneName };
+function configureHandWeightPaint(enabled, boneName = selectedBoneName, options = {}) {
+  const radiusRatio = Number(options.radiusRatio);
+  const strength = Number(options.strength);
+  handWeightPaint = {
+    ...handWeightPaint,
+    enabled: Boolean(enabled),
+    boneName: boneName || selectedBoneName,
+    radiusRatio: Number.isFinite(radiusRatio) ? THREE.MathUtils.clamp(radiusRatio, 0.002, 0.08) : handWeightPaint.radiusRatio,
+    strength: Number.isFinite(strength) ? THREE.MathUtils.clamp(strength, 0.05, 1) : handWeightPaint.strength,
+  };
+  if (handWeightPaint.enabled && avatarRoot) {
+    bonePivotDragEnabled = false;
+    handSegmentation.enabled = false;
+    activeAction?.stop(); activeAction = null;
+    clearProceduralOffsets(); manualPoseMode = true; restoreRestPose();
+    avatarRoot.updateMatrixWorld(true);
+  }
   showStatus(avatarDisplayName, handWeightPaint.enabled
-    ? `Pincel activo · ${handWeightPaint.boneName} · pinta la región visible; guardar crea otra versión GLB`
+    ? `Pincel activo · ${handWeightPaint.boneName} · radio ${(handWeightPaint.radiusRatio * 100).toFixed(1)}% de altura · fuerza ${(handWeightPaint.strength * 100).toFixed(0)}%`
     : 'Pincel de pesos desactivado');
   return { ...handWeightPaint };
 }
@@ -624,6 +1036,7 @@ function undoHandWeightPaint() {
     }
     indices.needsUpdate = true; weights.needsUpdate = true;
   }
+  clearHandPaintSelection();
   if (action.handMappingReport) {
     const index = handMappingReports.indexOf(action.handMappingReport);
     if (index >= 0) handMappingReports.splice(index, 1);
@@ -631,6 +1044,129 @@ function undoHandWeightPaint() {
   buildHandWeightDiagnostic();
   showStatus(avatarDisplayName, 'Se deshizo la última pasada del pincel.');
   return true;
+}
+
+function assignHandPaintSelectionToBone() {
+  const boneName = handWeightPaint.boneName || selectedBoneName;
+  if (!avatarRoot || !boneName) {
+    return { changed: 0, message: 'Selecciona un hueso antes de asignar la región.' };
+  }
+  if (!handPaintSelection.size) {
+    return { changed: 0, message: 'Marca primero una región con el pincel; los vértices verdes forman la selección.' };
+  }
+  const action = new Map();
+  let changed = 0, selectedCount = 0, clearedOutside = 0, reassignedWithoutRemainder = 0, blockedOutside = 0;
+  const meshesToClean = new Map(handPaintSelection);
+  avatarRoot.traverse((mesh) => {
+    if (mesh.isSkinnedMesh && !meshesToClean.has(mesh)) meshesToClean.set(mesh, new Set());
+  });
+  for (const [mesh, selected] of meshesToClean) {
+    const indices = mesh.geometry.attributes.skinIndex;
+    const weights = mesh.geometry.attributes.skinWeight;
+    if (!indices || !weights || !mesh.skeleton) continue;
+    const meshBone = mesh.skeleton.bones.find((bone) => bone.name === boneName);
+    const boneIndex = meshBone ? mesh.skeleton.bones.indexOf(meshBone) : -1;
+    if (boneIndex < 0) continue;
+    const fallbackBones = [meshBone.parent, ...meshBone.children]
+      .filter((bone) => bone?.isBone && mesh.skeleton.bones.includes(bone) && bone !== meshBone);
+    const fallbackSegments = fallbackBones
+      .map((bone) => ({ index: mesh.skeleton.bones.indexOf(bone), segment: boneWorldSegment(bone) }))
+      .filter((item) => item.segment);
+    const undo = new Map();
+    const position = mesh.geometry.attributes.position;
+    const local = new THREE.Vector3(), world = new THREE.Vector3();
+    for (let vertex = 0; vertex < position.count; vertex++) {
+      const oldIndices = [0, 1, 2, 3].map((slot) => indices.getComponent(vertex, slot));
+      const oldWeights = [0, 1, 2, 3].map((slot) => weights.getComponent(vertex, slot));
+      if (!oldWeights.some((weight) => weight > 0)) continue;
+      const isSelected = selected.has(vertex);
+      const influence = new Map();
+      oldIndices.forEach((index, slot) => influence.set(index, (influence.get(index) || 0) + oldWeights[slot]));
+      const previous = influence.get(boneIndex) || 0;
+      if (isSelected) {
+        selectedCount++;
+        const alreadyAssigned = previous >= 0.999
+          && [...influence.entries()].every(([index, value]) => index === boneIndex || value <= 1e-5);
+        if (alreadyAssigned) continue;
+        undo.set(vertex, { indices: oldIndices, weights: oldWeights });
+        indices.setComponent(vertex, 0, boneIndex);
+        weights.setComponent(vertex, 0, 1);
+        for (let slot = 1; slot < 4; slot++) {
+          indices.setComponent(vertex, slot, boneIndex);
+          weights.setComponent(vertex, slot, 0);
+        }
+        changed++;
+        continue;
+      }
+      if (previous <= 1e-5) continue;
+      influence.delete(boneIndex);
+      let chosen = [...influence.entries()]
+        .filter(([, weight]) => weight > 1e-5)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4);
+      if (!chosen.length && fallbackSegments.length) {
+        mesh.getVertexPosition(vertex, local);
+        world.copy(local);
+        mesh.localToWorld(world);
+        const nearest = fallbackSegments
+          .map((candidate) => ({
+            index: candidate.index,
+            distance: distanceToBoneSegmentSq(world, candidate.segment),
+          }))
+          .sort((a, b) => a.distance - b.distance)[0];
+        if (nearest) {
+          chosen = [[nearest.index, 1]];
+          reassignedWithoutRemainder++;
+        }
+      }
+      if (!chosen.length) {
+        blockedOutside++;
+        continue;
+      }
+      undo.set(vertex, { indices: oldIndices, weights: oldWeights });
+      const total = chosen.reduce((sum, item) => sum + item[1], 0) || 1;
+      for (let slot = 0; slot < 4; slot++) {
+        indices.setComponent(vertex, slot, chosen[slot]?.[0] ?? chosen[0][0]);
+        weights.setComponent(vertex, slot, chosen[slot] ? chosen[slot][1] / total : 0);
+      }
+      clearedOutside++;
+    }
+    if (undo.size) {
+      indices.needsUpdate = true;
+      weights.needsUpdate = true;
+      action.set(mesh, undo);
+    }
+  }
+  let residualOutsideVertices = 0, residualOutsideWeight = 0;
+  for (const [mesh, selected] of meshesToClean) {
+    const indices = mesh.geometry.attributes.skinIndex;
+    const weights = mesh.geometry.attributes.skinWeight;
+    const boneIndex = mesh.skeleton?.bones.findIndex((bone) => bone.name === boneName) ?? -1;
+    if (!indices || !weights || boneIndex < 0) continue;
+    for (let vertex = 0; vertex < weights.count; vertex++) {
+      if (selected.has(vertex)) continue;
+      let influence = 0;
+      for (let slot = 0; slot < 4; slot++) {
+        if (indices.getComponent(vertex, slot) === boneIndex) influence += weights.getComponent(vertex, slot);
+      }
+      if (influence > 1e-4) {
+        residualOutsideVertices++;
+        residualOutsideWeight += influence;
+      }
+    }
+  }
+  if (action.size) handWeightUndo.push(action);
+  buildHandWeightDiagnostic(boneName);
+  handWeightsVisible = true;
+  if (handWeightDiagnostic) handWeightDiagnostic.visible = true;
+  rebuildHandPaintSelectionOverlay();
+  const message = changed || clearedOutside || blockedOutside
+    ? `${changed} vértices verdes asignados al 100% a ${boneName}; se retiró ese hueso de ${clearedOutside} vértices fuera de la selección${reassignedWithoutRemainder ? ` y ${reassignedWithoutRemainder} recibieron el hueso vecino más próximo` : ''}. Verificación: ${residualOutsideVertices} vértices fuera conservan influencia de ${boneName}${blockedOutside ? `; ${blockedOutside} no pudieron limpiarse por falta de hueso alternativo` : ''}. Deshaz si hace falta y guarda el GLB.`
+    : selectedCount
+      ? `Los ${selectedCount} vértices seleccionados ya estaban asignados a ${boneName}.`
+      : 'La selección no contiene vértices ponderados válidos para el hueso seleccionado.';
+  showStatus(avatarDisplayName, message);
+  return { changed, selected: selectedCount, cleared_outside: clearedOutside, reassigned: reassignedWithoutRemainder, blocked_outside: blockedOutside, residual_outside_vertices: residualOutsideVertices, residual_outside_weight: residualOutsideWeight, bone: boneName, message };
 }
 
 function autoCorrectFingerWeights(side) {
@@ -787,56 +1323,44 @@ function undoFingerSkeletonFit() {
     bone.position.copy(position);
     boneRestPositions.set(bone, action.restPositions.get(bone));
   }
+  restoreNamedMap(manualBonePositions, action.positionOffsets);
+  restoreNamedMap(bonePivotCompensations, action.pivotCompensations);
   avatarRoot?.updateMatrixWorld(true);
   for (const [skeleton, inverses] of action.inverses) {
     skeleton.boneInverses = inverses.map((matrix) => matrix.clone());
     skeleton.update();
   }
+  if (action.pivotEdit) {
+    const index = bonePivotEdits.lastIndexOf(action.pivotEdit);
+    if (index >= 0) bonePivotEdits.splice(index, 1);
+  }
   avatarRoot?.updateMatrixWorld(true);
-  showStatus(avatarDisplayName, 'Se deshizo el último ajuste de huesos de dedos.');
+  showStatus(avatarDisplayName, 'Se deshizo el último ajuste provisional de pivote/huesos.');
   return true;
 }
 
 function autoCorrectSelectedBoneWeights(boneName = selectedBoneName) {
   const bone = findBone(boneName);
   if (!bone || !avatarRoot) return { changed: 0, message: 'Selecciona primero un hueso del esqueleto.' };
+  if (manualBoneRotations.size) return { changed: 0, message: 'Restaura los giros manuales para corregir pesos en pose neutral.' };
+  activeAction?.stop(); activeAction = null; clearProceduralOffsets(); manualPoseMode = true; restoreRestPose();
   avatarRoot.updateMatrixWorld(true);
-  const continuationByBone = {
-    hips: 'spine', spine: 'chest', chest: 'neck', neck: 'head',
-    leftShoulder: 'leftUpperArm', rightShoulder: 'rightUpperArm',
-    leftUpperArm: 'leftLowerArm', rightUpperArm: 'rightLowerArm',
-    leftLowerArm: 'leftHand', rightLowerArm: 'rightHand',
-    leftUpperLeg: 'leftLowerLeg', rightUpperLeg: 'rightLowerLeg',
-    leftLowerLeg: 'leftFoot', rightLowerLeg: 'rightFoot',
-    leftFoot: 'leftToes', rightFoot: 'rightToes',
-  };
-  const segmentForBone = (node) => {
-    const start = node.getWorldPosition(new THREE.Vector3());
-    const continuation = continuationByBone[node.name];
-    const child = node.children.find((item) => item.isBone && item.name === continuation)
-      || node.children.find((item) => item.isBone);
-    const end = child ? child.getWorldPosition(new THREE.Vector3()) : start.clone();
-    const direction = end.clone().sub(start);
-    return { start, end, direction, lengthSq: direction.lengthSq() };
-  };
-  const selectedSegment = segmentForBone(bone);
+  const selectedSegment = boneWorldSegment(bone);
   const height = new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y;
-  const radius = Math.max(0.008, height * 0.014), radiusSq = radius * radius;
-  const action = new Map(); let examined = 0, changed = 0;
+  const segmentLength = Math.sqrt(selectedSegment.lengthSq);
+  const radius = Math.max(0.008, height * 0.014, segmentLength * 0.24), radiusSq = radius * radius;
+  const cleanupRadius = Math.max(radius * 1.8, height * 0.035), cleanupRadiusSq = cleanupRadius * cleanupRadius;
+  const margin = Math.max(height * 0.008, radius * 0.2);
+  const action = new Map(); let examined = 0, changed = 0, cleaned = 0;
   const world = new THREE.Vector3(), local = new THREE.Vector3();
-  const distanceToSegmentSq = (point, segment) => {
-    const dx = point.x - segment.start.x, dy = point.y - segment.start.y, dz = point.z - segment.start.z;
-    const along = segment.lengthSq > 1e-10 ? THREE.MathUtils.clamp((dx * segment.direction.x + dy * segment.direction.y + dz * segment.direction.z) / segment.lengthSq, 0, 1) : 0;
-    const x = dx - segment.direction.x * along, y = dy - segment.direction.y * along, z = dz - segment.direction.z * along;
-    return x * x + y * y + z * z;
-  };
   avatarRoot.traverse((mesh) => {
     if (!mesh.isSkinnedMesh) return;
     const indices = mesh.geometry.attributes.skinIndex, weights = mesh.geometry.attributes.skinWeight;
     if (!indices || !weights) return;
     const boneIndex = mesh.skeleton.bones.indexOf(bone);
     if (boneIndex < 0) return;
-    const boneSegments = mesh.skeleton.bones.map(segmentForBone);
+    const boneSegments = mesh.skeleton.bones.map((item) => ({ bone: item, segment: boneWorldSegment(item) }))
+      .filter((item) => item.segment && item.segment.lengthSq >= 1e-10);
     const adjacent = new Set([boneIndex]);
     const parentIndex = mesh.skeleton.bones.indexOf(bone.parent);
     if (parentIndex >= 0) adjacent.add(parentIndex);
@@ -847,78 +1371,164 @@ function autoCorrectSelectedBoneWeights(boneName = selectedBoneName) {
     const undo = new Map(), position = mesh.geometry.attributes.position;
     for (let vertex = 0; vertex < position.count; vertex++) {
       mesh.getVertexPosition(vertex, local); world.copy(local); mesh.localToWorld(world);
-      const targetDistanceSq = distanceToSegmentSq(world, selectedSegment);
-      if (targetDistanceSq > radiusSq) continue;
-      let closestIndex = boneIndex, closestDistanceSq = targetDistanceSq;
-      for (let otherIndex = 0; otherIndex < boneSegments.length; otherIndex++) {
-        if (otherIndex === boneIndex) continue;
-        const distanceSq = distanceToSegmentSq(world, boneSegments[otherIndex]);
-        if (distanceSq < closestDistanceSq) { closestDistanceSq = distanceSq; closestIndex = otherIndex; }
-      }
-      if (!adjacent.has(closestIndex) && Math.sqrt(targetDistanceSq) > Math.sqrt(closestDistanceSq) + radius * 0.2) continue;
-      examined++;
       const oldIndices = [0,1,2,3].map((slot) => indices.getComponent(vertex, slot));
       const oldWeights = [0,1,2,3].map((slot) => weights.getComponent(vertex, slot));
       if (!oldWeights.some((value) => value > 0)) continue;
       const influence = new Map(); oldIndices.forEach((index, slot) => influence.set(index, (influence.get(index) || 0) + oldWeights[slot]));
       const previous = influence.get(boneIndex) || 0;
-      if (previous >= 0.96) continue;
+      const targetDistanceSq = distanceToBoneSegmentSq(world, selectedSegment);
+      if (targetDistanceSq > cleanupRadiusSq && previous < 0.08) continue;
+      let closestIndex = boneIndex, closestDistanceSq = targetDistanceSq;
+      for (const item of boneSegments) {
+        const otherIndex = mesh.skeleton.bones.indexOf(item.bone);
+        if (otherIndex === boneIndex) continue;
+        const distanceSq = distanceToBoneSegmentSq(world, item.segment);
+        if (distanceSq < closestDistanceSq) { closestDistanceSq = distanceSq; closestIndex = otherIndex; }
+      }
+      const clearlyOutside = previous >= 0.08 && targetDistanceSq > cleanupRadiusSq
+        && closestIndex !== boneIndex
+        && Math.sqrt(targetDistanceSq) > Math.sqrt(closestDistanceSq) + margin;
+      const locallyEligible = targetDistanceSq <= radiusSq
+        && (adjacent.has(closestIndex) || Math.sqrt(targetDistanceSq) <= Math.sqrt(closestDistanceSq) + margin);
+      if (clearlyOutside) {
+        influence.delete(boneIndex);
+        let chosen = [...influence.entries()].filter(([, value]) => value > 1e-5).sort((a,b) => b[1]-a[1]).slice(0,4);
+        if (!chosen.length) chosen = [[Math.max(0, closestIndex), 1]];
+        undo.set(vertex, { indices: oldIndices, weights: oldWeights });
+        const total = chosen.reduce((sum, item) => sum + item[1], 0) || 1;
+        for (let slot = 0; slot < 4; slot++) { indices.setComponent(vertex, slot, chosen[slot]?.[0] ?? chosen[0][0]); weights.setComponent(vertex, slot, chosen[slot] ? chosen[slot][1] / total : 0); }
+        cleaned++;
+        continue;
+      }
+      if (!locallyEligible) continue;
+      examined++;
+      if (previous >= 0.72) continue;
       undo.set(vertex, { indices: oldIndices, weights: oldWeights });
       const target = Math.max(previous, 0.72);
       for (const [index, value] of influence) influence.set(index, index === boneIndex ? target : value * (1 - target) / Math.max(1e-8, 1 - previous));
       influence.set(boneIndex, target);
       const chosen = [...influence.entries()].filter(([, value]) => value > 1e-5).sort((a,b) => b[1]-a[1]).slice(0,4), total = chosen.reduce((sum, item) => sum + item[1], 0) || 1;
       for (let slot = 0; slot < 4; slot++) { indices.setComponent(vertex, slot, chosen[slot]?.[0] ?? boneIndex); weights.setComponent(vertex, slot, chosen[slot] ? chosen[slot][1] / total : 0); }
-      changed++;
+      if (target > previous + 1e-5) changed++;
     }
     if (undo.size) { indices.needsUpdate = true; weights.needsUpdate = true; action.set(mesh, undo); }
   });
   if (action.size) { handWeightUndo.push(action); buildHandWeightDiagnostic(boneName); handWeightsVisible = true; handWeightDiagnostic.visible = true; }
-  const message = changed ? `Propuesta para ${boneName}: ${changed} vértices modificados cerca del hueso. Revisa los pesos y deshaz si hace falta.` : `No se encontraron vértices corregibles cerca de ${boneName} (${examined} revisados).`;
+  const message = changed || cleaned
+    ? `Propuesta para ${boneName}: ${changed} vértices reforzados cerca del segmento y ${cleaned} influencias lejanas retiradas. Revisa el mapa y deshaz si hace falta.`
+    : `No se encontraron pesos corregibles para ${boneName} (${examined} vértices locales revisados).`;
   showStatus(avatarDisplayName, message);
-  return { changed, examined, radius, bone: boneName, message };
+  return { changed, cleaned, examined, radius, cleanup_radius: cleanupRadius, bone: boneName, message };
 }
 
 function centerSelectedBonePivotOnWeights(boneName = selectedBoneName) {
   const bone = findBone(boneName);
   if (!bone || !avatarRoot) return { moved: false, message: 'Selecciona primero un hueso del esqueleto.' };
-  if (manualBonePositions.size || manualBoneRotations.size) return { moved: false, message: 'Restaura el rig completo antes de centrar un pivote.' };
+  if (manualBoneRotations.size) return { moved: false, message: 'Restaura los giros manuales antes de proponer un pivote.' };
   activeAction?.stop(); activeAction = null; manualPoseMode = true; clearProceduralOffsets(); restoreRestPose(); avatarRoot.updateMatrixWorld(true);
   const height = new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y;
-  const total = new THREE.Vector3(); let sum = 0, samples = 0, point = new THREE.Vector3();
-  avatarRoot.traverse((mesh) => {
-    if (!mesh.isSkinnedMesh) return;
-    const indices = mesh.geometry.attributes.skinIndex, weights = mesh.geometry.attributes.skinWeight, boneIndex = mesh.skeleton.bones.indexOf(bone);
-    if (!indices || !weights || boneIndex < 0) return;
-    for (let vertex = 0; vertex < indices.count; vertex++) {
-      let influence = 0, dominantWeight = -1, dominantIndex = -1;
-      for (let slot = 0; slot < 4; slot++) {
-        const index = indices.getComponent(vertex, slot), weight = weights.getComponent(vertex, slot);
-        if (index === boneIndex) influence += weight;
-        if (weight > dominantWeight) { dominantWeight = weight; dominantIndex = index; }
+  let target = null, samples = 0, method = 'centroide_local_de_pesos';
+  if (boneName.toLowerCase() === 'hips') {
+    // Hips is the pelvis root, not the centroid of every vertex it influences.
+    // Its semantic landmark is the midpoint between both thigh-root joints.
+    const leftHip = findBone('leftUpperLeg'), rightHip = findBone('rightUpperLeg');
+    if (!leftHip || !rightHip) return { moved: false, message: 'No encuentro ambas raíces de muslo; no moveré hips usando el centroide de sus pesos.' };
+    const left = leftHip.getWorldPosition(new THREE.Vector3()), right = rightHip.getWorldPosition(new THREE.Vector3());
+    const span = left.distanceTo(right);
+    if (span < height * 0.025 || span > height * 0.40) return { moved: false, message: 'Las raíces de muslo no forman una referencia fiable para hips. Ajusta el pivote manualmente y revisa la pose.' };
+    target = left.add(right).multiplyScalar(0.5);
+    samples = 2;
+    method = 'midpoint_between_thigh_roots';
+  } else {
+    const weightedPoints = [], total = new THREE.Vector3(), point = new THREE.Vector3(); let sum = 0;
+    avatarRoot.traverse((mesh) => {
+      if (!mesh.isSkinnedMesh) return;
+      const indices = mesh.geometry.attributes.skinIndex, weights = mesh.geometry.attributes.skinWeight, boneIndex = mesh.skeleton.bones.indexOf(bone);
+      if (!indices || !weights || boneIndex < 0) return;
+      for (let vertex = 0; vertex < indices.count; vertex++) {
+        let influence = 0, dominantWeight = -1, dominantIndex = -1;
+        for (let slot = 0; slot < 4; slot++) {
+          const index = indices.getComponent(vertex, slot), weight = weights.getComponent(vertex, slot);
+          if (index === boneIndex) influence += weight;
+          if (weight > dominantWeight) { dominantWeight = weight; dominantIndex = index; }
+        }
+        if (influence < 0.55 || dominantIndex !== boneIndex) continue;
+        mesh.getVertexPosition(vertex, point); mesh.localToWorld(point);
+        weightedPoints.push([point.clone(), influence]); total.addScaledVector(point, influence); sum += influence; samples++;
       }
-      if (influence < 0.35 || dominantIndex !== boneIndex) continue;
-      mesh.getVertexPosition(vertex, point); mesh.localToWorld(point); total.addScaledVector(point, influence); sum += influence; samples++;
-    }
-  });
-  if (samples < 8 || !bone.parent || sum <= 0) return { moved: false, samples, message: `No hay suficientes pesos de ${boneName} para estimar su pivote.` };
-  const target = total.multiplyScalar(1 / sum), current = bone.getWorldPosition(new THREE.Vector3());
-  if (target.distanceTo(current) > height * 0.08) return { moved: false, samples, message: 'El centro de pesos queda demasiado lejos del pivote; corrige los pesos primero.' };
-  const skeletons = new Set(); avatarRoot.traverse((mesh) => { if (mesh.isSkinnedMesh) skeletons.add(mesh.skeleton); });
-  const inverses = new Map([...skeletons].map((skeleton) => [skeleton, skeleton.boneInverses.map((matrix) => matrix.clone())]));
-  const worlds = new Map([...skeletons].map((skeleton) => [skeleton, skeleton.bones.map((node) => node.matrixWorld.clone())]));
-  const old = bone.position.clone(), rest = boneRestPositions.get(bone)?.clone() || old.clone();
-  bone.position.copy(bone.parent.worldToLocal(target.clone())); avatarRoot.updateMatrixWorld(true);
-  for (const skeleton of skeletons) preserveBindTransforms(skeleton, worlds.get(skeleton), inverses.get(skeleton));
-  boneRestPositions.set(bone, bone.position.clone());
-  handBoneUndo.push({ positions: new Map([[bone, old]]), restPositions: new Map([[bone, rest]]), inverses });
-  showStatus(avatarDisplayName, `Pivote de ${boneName} centrado provisionalmente en ${samples} vértices ponderados. Revisa y deshaz si no coincide con la articulación.`);
-  return { moved: true, bone: boneName, samples, distance: target.distanceTo(current) };
+    });
+    if (samples < 8 || sum <= 0) return { moved: false, samples, message: `No hay suficientes pesos dominantes de ${boneName} para proponer un pivote.` };
+    target = total.multiplyScalar(1 / sum);
+    const maxSpread = Math.max(...weightedPoints.map(([position]) => position.distanceTo(target)));
+    if (maxSpread > height * 0.045) return { moved: false, samples, spread: maxSpread, message: `Los pesos de ${boneName} cubren una zona amplia (${(maxSpread / height * 100).toFixed(1)}% de la altura); su centroide no representa una articulación. No moví el hueso.` };
+  }
+  if (!bone.parent || !target) return { moved: false, samples, message: `No pude obtener un hito anatómico seguro para ${boneName}.` };
+  const current = bone.getWorldPosition(new THREE.Vector3());
+  if (target.distanceTo(current) > height * 0.08) return { moved: false, samples, message: `La propuesta ${method} queda demasiado lejos de ${boneName}; no moví el hueso. Ajusta el pivote manualmente.` };
+  discardSelectedBonePivotProposal();
+  pendingBonePivotProposal = {
+    bone, target: target.clone(), method, samples, distance: target.distanceTo(current),
+    bones: [...boneRestQuaternions.keys()].map((node) => [node, node.matrixWorld.clone()]),
+  };
+  const markerSize = Math.max(height * 0.009, 0.008);
+  bonePivotProposalMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(markerSize, 12, 8),
+    new THREE.MeshBasicMaterial({ color: 0x35e0d0, depthTest: false, transparent: true, opacity: 0.98 }),
+  );
+  bonePivotProposalMarker.name = `RigM proposed pivot · ${boneName}`;
+  bonePivotProposalMarker.position.copy(target);
+  bonePivotProposalMarker.renderOrder = 20;
+  scene.add(bonePivotProposalMarker);
+  const message = bone.name.toLowerCase() === 'hips'
+    ? 'Propuesta hips: punto medio entre ambas raíces de muslo. El rig no se movió; el marcador cian muestra el candidato.'
+    : `Propuesta ${boneName}: hito estimado desde ${samples} vértices compactos. El rig no se movió; el marcador cian muestra el candidato.`;
+  showStatus(avatarDisplayName, message);
+  return { moved: false, proposed: true, bone: boneName, samples, method, distance: target.distanceTo(current), message };
+}
+
+function discardSelectedBonePivotProposal() {
+  pendingBonePivotProposal = null;
+  if (bonePivotProposalMarker) {
+    scene.remove(bonePivotProposalMarker);
+    bonePivotProposalMarker.geometry.dispose();
+    bonePivotProposalMarker.material.dispose();
+    bonePivotProposalMarker = null;
+  }
+  return true;
+}
+
+function applySelectedBonePivotProposal() {
+  const proposal = pendingBonePivotProposal;
+  if (!proposal || !avatarRoot) return { moved: false, message: 'Primero genera y revisa una propuesta de pivote.' };
+  avatarRoot.updateMatrixWorld(true);
+  if (proposal.bones.some(([node, matrix]) => !node.matrixWorld.equals(matrix))) {
+    discardSelectedBonePivotProposal();
+    return { moved: false, message: 'El rig cambió después de generar la propuesta; no se aplicó. Genera otra.' };
+  }
+  const { bone, target, method, samples, distance } = proposal;
+  if (!bone.parent) {
+    discardSelectedBonePivotProposal();
+    return { moved: false, message: 'El hueso no tiene padre editable; no se aplicó la propuesta.' };
+  }
+  if (manualBoneRotations.size) {
+    discardSelectedBonePivotProposal();
+    return { moved: false, message: 'Restaura los giros manuales antes de aplicar un pivote.' };
+  }
+  const result = moveBonePivotToWorld(bone, target, { method });
+  discardSelectedBonePivotProposal();
+  const message = bone.name.toLowerCase() === 'hips'
+    ? 'Se aplicó el pivote hips en el punto medio entre ambas raíces de muslo. Revisa la pelvis; puedes deshacer.'
+    : `Se aplicó el pivote ${bone.name} desde ${samples} vértices dominantes y compactos. Revisa y deshaz si no coincide con la articulación.`;
+  showStatus(avatarDisplayName, message);
+  return { moved: result.moved, bone: bone.name, samples, method, distance, message: result.moved ? message : result.message };
 }
 
 function playSelectedBoneTest(boneName = selectedBoneName) {
   const bone = findBone(boneName);
   if (!bone || !mixer) return { ok: false, message: 'Selecciona un hueso en un rig animable.' };
+  mixer.stopAllAction(); activeAction = null;
+  clearProceduralOffsets(); restoreRestPose(); manualPoseMode = true;
+  avatarRoot.updateMatrixWorld(true);
   const rest = boneRestQuaternions.get(bone) || bone.quaternion.clone();
   const times = [0,.45,.9,1.35,1.8,2.25,2.7,3.15,3.6], values = [];
   const poses = [[0,0,0],[25,0,0],[0,0,0],[-25,0,0],[0,0,0],[0,25,0],[0,0,0],[0,0,25],[0,0,0]];
@@ -926,7 +1536,7 @@ function playSelectedBoneTest(boneName = selectedBoneName) {
     const delta = new THREE.Quaternion().setFromEuler(new THREE.Euler(THREE.MathUtils.degToRad(x),THREE.MathUtils.degToRad(y),THREE.MathUtils.degToRad(z),'XYZ'));
     const q = rest.clone().multiply(delta); values.push(q.x,q.y,q.z,q.w);
   }
-  activeAction?.stop(); clearProceduralOffsets(); manualPoseMode = false;
+  manualPoseMode = true;
   const clip = new THREE.AnimationClip(`RigM Bone Test ${boneName}`,3.6,[new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`,times,values)]);
   const action = mixer.clipAction(clip); action.reset(); action.setLoop(THREE.LoopOnce,1); action.clampWhenFinished=false; action.play(); activeAction=action;
   action.getMixer().addEventListener('finished',event=>{ if(event.action===action){action.stop();restoreRestPose();activeAction=null;manualPoseMode=true;} });
@@ -956,8 +1566,50 @@ function focusBone(name) {
   return true;
 }
 
+function setViewAxis(axis, sign = 1) {
+  if (!['x', 'y', 'z'].includes(String(axis).toLowerCase())) return { ok: false, message: 'Eje de vista inválido.' };
+  const normalizedAxis = String(axis).toLowerCase();
+  const direction = Math.sign(Number(sign)) || 1;
+  const bounds = avatarRoot ? new THREE.Box3().setFromObject(avatarRoot) : null;
+  const target = bounds && !bounds.isEmpty() ? bounds.getCenter(new THREE.Vector3()) : controls.target.clone();
+  const size = bounds && !bounds.isEmpty() ? bounds.getSize(new THREE.Vector3()) : new THREE.Vector3(1, 1, 1);
+  const distance = Math.max(size.length() * 1.45, size.y * 2.2, 0.5);
+  const offset = new THREE.Vector3();
+  offset[normalizedAxis] = direction * distance;
+  camera.up.set(0, 1, 0);
+  if (normalizedAxis === 'y') camera.up.set(0, 0, direction > 0 ? -1 : 1);
+  controls.target.copy(target);
+  camera.position.copy(target).add(offset);
+  camera.near = Math.max(0.001, size.y * 0.001);
+  camera.far = Math.max(100, distance * 20);
+  camera.updateProjectionMatrix();
+  camera.lookAt(target);
+  camera.updateMatrixWorld(true);
+  controls.update();
+  return { ok: true, axis: normalizedAxis, sign: direction, message: `Vista alineada con ${direction > 0 ? '+' : '−'}${normalizedAxis.toUpperCase()}.` };
+}
+
+function centerSelectedBoneOnAxis(axis) {
+  const bone = findBone(selectedBoneName);
+  const normalizedAxis = String(axis).toLowerCase();
+  if (!bone || !avatarRoot || !['x', 'y'].includes(normalizedAxis)) {
+    return { moved: false, message: 'Selecciona un hueso para centrarlo en X o Y.' };
+  }
+  if (manualBoneRotations.size) return { moved: false, message: 'Restaura los giros manuales antes de centrar el pivote.' };
+  activeAction?.stop(); activeAction = null; clearProceduralOffsets(); restoreRestPose(); avatarRoot.updateMatrixWorld(true);
+  const local = avatarRoot.worldToLocal(bone.getWorldPosition(new THREE.Vector3()));
+  const modelCenter = avatarRoot.worldToLocal(new THREE.Box3().setFromObject(avatarRoot).getCenter(new THREE.Vector3()));
+  local[normalizedAxis] = modelCenter[normalizedAxis];
+  const target = avatarRoot.localToWorld(local);
+  const result = moveBonePivotToWorld(bone, target, { method: `align_model_${normalizedAxis}_to_center` });
+  if (result.moved) showStatus(avatarDisplayName, `Pivote ${bone.name} alineado con el centro geométrico del modelo en ${normalizedAxis.toUpperCase()}; puedes deshacer.`);
+  return result;
+}
+
 function playHandTest(side) {
   if (!['left', 'right'].includes(side) || !mixer) return {ok:false,message:'No hay un rig animable para probar.'};
+  mixer.stopAllAction(); activeAction = null;
+  clearProceduralOffsets(); restoreRestPose(); manualPoseMode = true;
   const tracks = [], times = [0, 0.35, 0.75, 1.15, 1.55, 2.0];
   // Finger flexion is around the palm's width axis, which varies with the
   // imported rig's bone roll. A fixed local X axis makes some rigs twist.
@@ -983,7 +1635,7 @@ function playHandTest(side) {
     }
   }
   if (!tracks.length) return {ok:false,message:'No hay falanges para generar la prueba.'};
-  activeAction?.stop(); clearProceduralOffsets(); manualPoseMode = false;
+  manualPoseMode = true;
   const clip = new THREE.AnimationClip(`RigM Hand Test ${side}`, 2, tracks);
   const action = mixer.clipAction(clip); action.reset(); action.setLoop(THREE.LoopOnce,1); action.clampWhenFinished = false; action.play(); activeAction = action;
   action.getMixer().addEventListener('finished', (event) => { if (event.action === action) { action.stop(); restoreRestPose(); activeAction = null; manualPoseMode = true; } });
@@ -993,6 +1645,8 @@ function playHandTest(side) {
 
 function playWristTest(side) {
   if (!['left','right'].includes(side) || !mixer) return {ok:false,message:'No hay un rig animable para probar la muñeca.'};
+  mixer.stopAllAction(); activeAction = null;
+  clearProceduralOffsets(); restoreRestPose(); manualPoseMode = true;
   const bone = findBone(`${side}Hand`);
   if (!bone) return {ok:false,message:`No encuentro el hueso ${side}Hand.`};
   const rest = boneRestQuaternions.get(bone) || bone.quaternion.clone();
@@ -1002,7 +1656,7 @@ function playWristTest(side) {
     const delta = new THREE.Quaternion().setFromEuler(new THREE.Euler(THREE.MathUtils.degToRad(x),THREE.MathUtils.degToRad(y),THREE.MathUtils.degToRad(z),'XYZ'));
     const q = rest.clone().multiply(delta); values.push(q.x,q.y,q.z,q.w);
   }
-  activeAction?.stop(); clearProceduralOffsets(); manualPoseMode = false;
+  manualPoseMode = true;
   const clip = new THREE.AnimationClip(`RigM Wrist Test ${side}`, 3.6, [new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`,times,values)]);
   const action = mixer.clipAction(clip); action.reset(); action.setLoop(THREE.LoopOnce,1); action.clampWhenFinished=false; action.play(); activeAction=action;
   action.getMixer().addEventListener('finished', event => { if (event.action===action) { action.stop(); restoreRestPose(); activeAction=null; manualPoseMode=true; } });
@@ -1025,18 +1679,27 @@ function resetBone(name) {
   manualBoneRotations.delete(name);
   const node = findBone(name), rest = node && boneRestQuaternions.get(node);
   if (node && rest) node.quaternion.copy(rest);
-  manualBonePositions.delete(name);
-  const position = node && boneRestPositions.get(node);
-  if (node && position) node.position.copy(position);
+  if (node) setBonePosition(name, [0, 0, 0]);
 }
 function resetAllBones() {
   manualBoneRotations.clear();
   manualBonePositions.clear();
+  bonePivotCompensations.clear();
   manualPoseMode = true;
   activeAction?.stop(); activeAction = null;
+  for (const [bone, position] of boneOriginalRestPositions) boneRestPositions.set(bone, position.clone());
   restoreRestPose();
+  avatarRoot?.updateMatrixWorld(true);
+  for (const [skeleton, inverses] of boneRestInverses) {
+    skeleton.boneInverses = inverses.map((matrix) => matrix.clone());
+    skeleton.update();
+  }
+  handBoneUndo = [];
+  bonePivotEdits.length = 0;
+  avatarRoot?.updateMatrixWorld(true);
 }
 function selectBone(name) {
+  if (handPaintSelection.size && handWeightPaint.boneName && handWeightPaint.boneName !== name) clearHandPaintSelection();
   selectedBoneName = String(name || '');
   if (selectedBoneMarker) selectedBoneMarker.visible = Boolean(findBone(selectedBoneName));
   if (handWeightsVisible) setHandWeightDiagnostics(true, selectedBoneName);
@@ -1046,13 +1709,16 @@ function selectBone(name) {
 function getBonePosition(name) { return manualBonePositions.get(name) || [0, 0, 0]; }
 function setBonePosition(name, offsets) {
   const node = findBone(name), rest = node && boneRestPositions.get(node);
-  if (!node || !rest) return false;
+  if (!node || !rest || !node.parent) return false;
   manualPoseMode = true;
   activeAction?.stop(); activeAction = null;
+  clearProceduralOffsets();
+  restoreRestPose();
+  avatarRoot.updateMatrixWorld(true);
   const value = offsets.map((item) => Number(item) || 0);
-  manualBonePositions.set(name, value);
-  node.position.copy(rest).add(new THREE.Vector3(...value));
-  return true;
+  const targetLocal = rest.clone().add(new THREE.Vector3(...value)).add(vectorMapValue(bonePivotCompensations, name));
+  const targetWorld = node.parent.localToWorld(targetLocal);
+  return moveBonePivotToWorld(node, targetWorld, { method: 'manual_local_position_control', coalesce: true }).moved;
 }
 
 function restoreRestPose() {
@@ -1060,7 +1726,9 @@ function restoreRestPose() {
     node.quaternion.copy(rest);
     const manual = manualBoneRotations.get(node.name);
     if (manual) node.quaternion.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(...manual, 'XYZ')));
-    node.position.copy(boneRestPositions.get(node)).add(new THREE.Vector3(...(manualBonePositions.get(node.name) || [0, 0, 0])));
+    node.position.copy(boneRestPositions.get(node))
+      .add(vectorMapValue(manualBonePositions, node.name))
+      .add(vectorMapValue(bonePivotCompensations, node.name));
   }
 }
 
@@ -1405,6 +2073,7 @@ function animate(now) {
       for (const marker of handDiagnosticGroup.children) marker.userData.bone?.getWorldPosition(marker.position);
     }
     if (handWeightDiagnostic?.visible) updateHandWeightDiagnostic();
+    if (handPaintSelectionGroup?.visible) updateHandPaintSelectionOverlay();
   }
   controls.update();
   if (selectedBoneMarker?.visible) {
@@ -1760,6 +2429,7 @@ async function saveEditedModel() {
   try {
   const report = { method: 'rigm_threejs_pose_edit', bones: autoRigBones.length, confidence: 'user_review',
     region_weight_mappings: handMappingReports,
+    bone_pivot_edits: bonePivotEdits,
     warnings: ['GLB actualizado desde la pose editada en RigM; revisa la deformación antes de producción.', ...(handMappingReports.length ? ['Los pesos incluyen propuestas SAM 2 locales aceptadas por la persona usuaria; revisa su correspondencia anatómica.'] : [])] };
   await transferGlb(report);
   showStatus(avatarDisplayName, 'Rig y pose editados guardados en el proyecto.');
@@ -1776,18 +2446,27 @@ window.rigmAvatar = {
   setSkeletonVisible(visible) { skeletonVisible = Boolean(visible); if (skeletonHelper) skeletonHelper.visible = skeletonVisible; },
   setHandDiagnostics,
   setJointDiagnostics: setHandDiagnostics,
+  setBoneLandmarkDiagnostics,
   setHandWeightDiagnostics,
   setBoneWeightDiagnostics: setHandWeightDiagnostics,
   configureHandWeightPaint,
+  clearHandPaintSelection,
   configureHandSegmentation,
   receiveHandSegmentation,
   applyHandSegmentationProposal,
   discardHandSegmentationProposal,
   undoHandWeightPaint,
+  assignHandPaintSelectionToBone,
   autoCorrectFingerWeights,
   autoCorrectSelectedBoneWeights,
   fitFingerSkeletonToWeights,
   centerSelectedBonePivotOnWeights,
+  configureBonePivotDrag,
+  configureBonePivotAxis,
+  setViewAxis,
+  centerSelectedBoneOnAxis,
+  applySelectedBonePivotProposal,
+  discardSelectedBonePivotProposal,
   undoFingerSkeletonFit,
   focusHand,
   focusBone,

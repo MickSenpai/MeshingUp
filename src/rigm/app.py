@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QAction, QActionGroup, QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -779,17 +779,13 @@ class MainWindow(QMainWindow):
         self.save_ik_button.clicked.connect(self._save_ik_keys)
         layout.addWidget(self.save_ik_button)
         layout.addWidget(QLabel("ANIMACIÓN"))
-        self.avatar3d_section_label = QLabel("IMPORTAR AVATAR 3D")
-        layout.addWidget(self.avatar3d_section_label)
-        self.avatar3d_attach_button = QPushButton("Importar GLB / VRM…")
+        self.avatar3d_attach_button = QAction("Cargar GLB / VRM…", self)
         self.avatar3d_attach_button.setEnabled(False)
-        self.avatar3d_attach_button.clicked.connect(self._attach_avatar3d)
-        layout.addWidget(self.avatar3d_attach_button)
-        self.avatar3d_viewer_button = QPushButton("Abrir visor 3D")
+        self.avatar3d_attach_button.triggered.connect(self._attach_avatar3d)
+        self.avatar3d_viewer_button = QAction("Abrir vista 3D", self)
         self.avatar3d_viewer_button.setEnabled(False)
         self.avatar3d_viewer_button.setToolTip("Abre el GLB o VRM del proyecto en el visor 3D local.")
-        self.avatar3d_viewer_button.clicked.connect(self._open_avatar3d_viewer)
-        layout.addWidget(self.avatar3d_viewer_button)
+        self.avatar3d_viewer_button.triggered.connect(self._open_avatar3d_viewer)
         behavior_row = QHBoxLayout()
         self.behavior_enabled = QCheckBox("Simular agente")
         self.behavior_enabled.setToolTip("Previsualiza estados reactivos en memoria; no cambia el archivo del proyecto.")
@@ -908,7 +904,11 @@ class MainWindow(QMainWindow):
         panel.setMaximumWidth(300)
 
         central = QWidget()
-        row = QHBoxLayout(central)
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        central_layout.addLayout(row, 1)
         panel_scroll = QScrollArea()
         panel_scroll.setWidgetResizable(True)
         panel_scroll.setWidget(panel)
@@ -919,77 +919,53 @@ class MainWindow(QMainWindow):
         self.tool_tabs.setMaximumWidth(330)
         self.tool_tabs.addTab(panel_scroll, "2D · Ilustración")
 
-        # Move the shared avatar controls to their own 3D workspace. All existing
-        # image segmentation, masks, 2D rigging, clips and expressions stay together.
-        layout.removeWidget(self.avatar3d_section_label)
-        layout.removeWidget(self.avatar3d_attach_button)
-        layout.removeWidget(self.avatar3d_viewer_button)
-        avatar_panel = QWidget()
-        avatar_layout = QVBoxLayout(avatar_panel)
-        avatar_layout.addWidget(QLabel("AVATAR 3D · GLB / VRM"))
-        avatar_intro = QLabel(
-            "Puedes importar un GLB con o sin esqueleto. El flujo recomendado usa Blender para auto-pesos; "
-            "después, RigM abre el visor para probar movimientos y guardar clips en el GLB."
-        )
-        avatar_intro.setWordWrap(True)
-        avatar_layout.addWidget(avatar_intro)
-        avatar_layout.addWidget(self.avatar3d_section_label)
-        avatar_layout.addWidget(self.avatar3d_attach_button)
-        self.avatar3d_parts_button = QPushButton("Analizar piezas extraíbles")
+        self.avatar3d_attach_button.setToolTip("Importa un GLB o VRM al proyecto actual.")
+        self.avatar3d_parts_button = QAction("Analizar piezas extraíbles", self)
         self.avatar3d_parts_button.setEnabled(False)
         self.avatar3d_parts_button.setToolTip("Inventaría piezas desconectadas y propone regiones corporales sin modificar el GLB fuente.")
-        self.avatar3d_parts_button.clicked.connect(self._analyze_avatar3d_parts)
-        avatar_layout.addWidget(self.avatar3d_parts_button)
-        avatar_layout.addWidget(QLabel("Frente del personaje (para el análisis)"))
+        self.avatar3d_parts_button.triggered.connect(self._analyze_avatar3d_parts)
         self.autorig_forward_combo = QComboBox()
         for axis, label in (("+Z", "+Z · GLB habitual"), ("-Z", "−Z"), ("+X", "+X"), ("-X", "−X")):
             self.autorig_forward_combo.addItem(label, axis)
         self.autorig_forward_combo.setToolTip("Dirección frontal del modelo glTF. El auto-rig geométrico actual infiere una pose humanoide erguida.")
-        avatar_layout.addWidget(self.autorig_forward_combo)
-        self.avatar3d_autorig_button = QPushButton("Auto-rig geométrico en visor · experimental")
+        self.avatar3d_autorig_button = QAction("Auto-rig geométrico en visor · experimental", self)
         self.avatar3d_autorig_button.setEnabled(False)
         self.avatar3d_autorig_button.setToolTip("Usa la inferencia heurística de Three.js. Para mejores pesos, prueba el auto-rig de Blender.")
-        self.avatar3d_autorig_button.clicked.connect(self._auto_rig_avatar3d)
-        avatar_layout.addWidget(self.avatar3d_autorig_button)
-        self.avatar3d_blender_button = QPushButton("Crear rig con Blender")
+        self.avatar3d_autorig_button.triggered.connect(self._auto_rig_avatar3d)
+        self.avatar3d_blender_button = QAction("Crear rig con Blender", self)
         self.avatar3d_blender_button.setEnabled(self.blender_available)
         self.avatar3d_blender_button.setToolTip(
             "Usa los pesos automáticos de Blender, respeta la dirección frontal seleccionada y puede rehacer el rig desde el GLB fuente."
         )
         if not self.blender_available:
             self.avatar3d_blender_button.setToolTip("Instala Blender o `org.blender.Blender` desde Flatpak para habilitar el auto-rig.")
-        self.avatar3d_blender_button.clicked.connect(self._auto_rig_avatar3d_blender)
-        avatar_layout.addWidget(self.avatar3d_blender_button)
-        self.avatar3d_rebuild_button = QPushButton("Rehacer esqueleto desde fuente")
+        self.avatar3d_blender_button.triggered.connect(self._auto_rig_avatar3d_blender)
+        self.avatar3d_rebuild_button = QAction("Rehacer esqueleto desde fuente", self)
         self.avatar3d_rebuild_button.setEnabled(False)
         self.avatar3d_rebuild_button.setToolTip("Abre el GLB original, sin rig, en el visor. No genera huesos. Para crear un rig usa el botón de Blender.")
-        self.avatar3d_rebuild_button.clicked.connect(self._rebuild_avatar3d_from_source)
-        avatar_layout.addWidget(self.avatar3d_rebuild_button)
-        avatar_layout.addWidget(self.avatar3d_viewer_button)
-        self.avatar3d_info = QLabel("La inferencia asume un humanoide erguido. El rig generado es editable y requiere revisión de pivotes/pesos.")
-        self.avatar3d_info.setWordWrap(True)
-        avatar_layout.addWidget(self.avatar3d_info)
-        avatar_layout.addStretch(1)
-        avatar_scroll = QScrollArea()
-        avatar_scroll.setWidgetResizable(True)
-        avatar_scroll.setMinimumWidth(260)
-        avatar_scroll.setMaximumWidth(330)
-        avatar_scroll.setWidget(avatar_panel)
-        self.tool_tabs.addTab(avatar_scroll, "3D · Avatar")
+        self.avatar3d_rebuild_button.triggered.connect(self._rebuild_avatar3d_from_source)
+        self.avatar3d_info = QAction(
+            "La inferencia asume un humanoide erguido. El rig generado requiere revisión de pivotes y pesos.", self
+        )
+        self.avatar3d_info.setEnabled(False)
+        self.avatar3d_top_status = QAction("Sin modelo cargado", self)
+        self.avatar3d_top_status.setEnabled(False)
         self.preview_tabs = QTabWidget()
         self.preview_tabs.setMinimumWidth(280)
         self.preview_tabs.addTab(self.canvas, "Vista 2D")
         self.avatar3d_placeholder = QLabel("Importa un GLB/VRM y abre la vista 3D para previsualizarlo.")
         self.avatar3d_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_tabs.addTab(self.avatar3d_placeholder, "Vista 3D")
+        self.preview_tabs.currentChanged.connect(self._update_editor_workspace_layout)
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.workspace_splitter.setChildrenCollapsible(False)
         self.workspace_splitter.addWidget(self.tool_tabs)
         self.workspace_splitter.addWidget(self.preview_tabs)
         self.workspace_splitter.setStretchFactor(0, 0)
         self.workspace_splitter.setStretchFactor(1, 1)
-        self.workspace_splitter.setSizes([300, 880])
+        self.workspace_splitter.setSizes([300, 1180])
         row.addWidget(self.workspace_splitter, 1)
+        self._update_editor_workspace_layout()
 
         self.library_table = QTableWidget(0, 6)
         self.library_table.setHorizontalHeaderLabels(["Rig", "Estado", "Etapa", "Capas", "Progreso", "Actualizado"])
@@ -1057,6 +1033,44 @@ class MainWindow(QMainWindow):
         save_action = QAction("Guardar proyecto…", self)
         save_action.triggered.connect(self.save_project)
         file_menu.addAction(save_action)
+
+        avatar_menu = self.menuBar().addMenu("Avatar 3D")
+        avatar_menu.addAction(self.avatar3d_attach_button)
+        avatar_menu.addAction(self.avatar3d_viewer_button)
+        avatar_menu.addSeparator()
+        avatar_menu.addAction(self.avatar3d_parts_button)
+        front_menu = avatar_menu.addMenu("Frente del personaje")
+        self.avatar_front_action_group = QActionGroup(self)
+        self.avatar_front_action_group.setExclusive(True)
+        self.avatar_front_actions: list[QAction] = []
+        for index in range(self.autorig_forward_combo.count()):
+            action = QAction(self.autorig_forward_combo.itemText(index), self)
+            action.setCheckable(True)
+            action.setActionGroup(self.avatar_front_action_group)
+            action.triggered.connect(
+                lambda _checked=False, i=index: self.autorig_forward_combo.setCurrentIndex(i)
+            )
+            front_menu.addAction(action)
+            self.avatar_front_actions.append(action)
+        avatar_menu.addSeparator()
+        avatar_menu.addAction(self.avatar3d_autorig_button)
+        avatar_menu.addAction(self.avatar3d_blender_button)
+        avatar_menu.addAction(self.avatar3d_rebuild_button)
+        avatar_menu.addSeparator()
+        avatar_menu.addAction(self.avatar3d_top_status)
+        avatar_menu.addAction(self.avatar3d_info)
+        avatar_menu.aboutToShow.connect(self._sync_avatar_menu)
+        self._sync_avatar_menu()
+
+    def _sync_avatar_menu(self) -> None:
+        for index, action in enumerate(self.avatar_front_actions):
+            action.setChecked(index == self.autorig_forward_combo.currentIndex())
+
+    def _update_editor_workspace_layout(self, *_args) -> None:
+        """Give the embedded 3D avatar viewport the full editor width."""
+        viewer = getattr(self, "avatar3d_dialog", None)
+        avatar_active = viewer is not None and self.preview_tabs.currentWidget() is viewer
+        self.tool_tabs.setVisible(not avatar_active and self.canvas.image_path is not None)
 
     def open_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Abrir ilustración", "", IMAGE_FILTER)
@@ -1126,7 +1140,6 @@ class MainWindow(QMainWindow):
             self.library.add(project_path)
             self._open_project_file(project_path)
             self.refresh_library()
-            self.tool_tabs.setCurrentIndex(1)
             self._open_avatar3d_viewer()
         except (OSError, ProjectError) as exc:
             QMessageBox.warning(self, "No pude crear el proyecto 3D", str(exc))
@@ -1162,10 +1175,14 @@ class MainWindow(QMainWindow):
         self.avatar3d_viewer_button.setEnabled(bool(avatar))
         if avatar:
             model_name = str(avatar.get("name", "Avatar 3D"))
+            model_format = str(avatar.get("format", "3D")).upper()
+            model_state = "con rig" if avatar.get("rigged") else "sin rig"
+            self.avatar3d_top_status.setText(f"{model_name}  ·  {model_format}  ·  {model_state}")
             self.avatar3d_placeholder.setText(
-                f"Modelo disponible: {model_name}.\nPulsa «Abrir visor 3D» para cargarlo aquí."
+                f"Modelo disponible: {model_name}.\nPulsa «Abrir vista 3D» para cargarlo aquí."
             )
         else:
+            self.avatar3d_top_status.setText("Sin modelo cargado")
             self.avatar3d_placeholder.setText("Importa un GLB/VRM y abre la vista 3D para previsualizarlo.")
         self.avatar3d_parts_button.setEnabled(bool(
             self.blender_available and avatar.get("format") == "glb"
@@ -1233,7 +1250,6 @@ class MainWindow(QMainWindow):
         self._set_ready(True)
         self.status.setText(f"Proyecto: {data.get('name', project_path.stem)} · {data.get('stage', 'skeleton')}")
         if not has_2d_source:
-            self.tool_tabs.setCurrentIndex(1)
             self.preview_tabs.setCurrentIndex(1)
             self.status.setText(f"Proyecto 3D: {data.get('name', project_path.stem)} · sin imagen 2D")
         self.tabs.setCurrentIndex(1)
@@ -1263,8 +1279,6 @@ class MainWindow(QMainWindow):
             if warnings:
                 detail += " Revisa: " + " ".join(warnings)
             self.status.setText(detail)
-            if result["avatar"]["format"] == "glb":
-                self.tool_tabs.setCurrentIndex(1)
             self._open_avatar3d_viewer()
         except (OSError, ProjectError) as exc:
             QMessageBox.warning(self, "No pude importar el modelo 3D", str(exc))
@@ -1458,6 +1472,7 @@ class MainWindow(QMainWindow):
                 project_path=self.project_path, expected_mtime_ns=self.loaded_mtime_ns,
                 allow_autorig=allow_autorig,
                 forward_axis=self.autorig_forward_combo.currentData(),
+                rigging_report=avatar.get("rigging", {}) if model_path.resolve() == (self.project_path.parent / avatar["path"]).resolve() else {},
             )
             self.avatar3d_dialog.setWindowFlags(Qt.WindowType.Widget)
             self.avatar3d_dialog.setMinimumSize(0, 0)

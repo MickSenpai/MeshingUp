@@ -507,6 +507,7 @@ for side_name, sign in (("left", 1), ("right", -1)):
             elbow_heights[len(elbow_heights) // 2],
         )
         hand_landmark_diagnostics[side_name]["elbow_position"] = [round(value, 5) for value in elbow]
+        hand_landmark_diagnostics[side_name]["elbow_samples"] = len(elbow_band)
         elbow_side = sign * abs((elbow[side_index] - center[side_index]) * side_sign)
         elbow_z = elbow.z
     add_bone(side_name + "Shoulder", body_point(sign * torso_width * 0.43, chest_z), shoulder, "chest")
@@ -631,6 +632,99 @@ for side_name, sign in (("left", 1), ("right", -1)):
     add_bone(side_name + "LowerLeg", knee, ankle, side_name + "UpperLeg")
     add_bone(side_name + "Foot", ankle, ball, side_name + "LowerLeg")
     add_bone(side_name + "Toes", ball, toe, side_name + "Foot")
+
+# Deform helpers add a controllable twist/volume correction inside long limb
+# segments. They remain separate from the anatomical chain and require an
+# animation or manual rotation to have an effect.
+limb_twist_bones = {}
+for segment_name in (
+    "leftUpperArm", "leftLowerArm", "rightUpperArm", "rightLowerArm",
+    "leftUpperLeg", "leftLowerLeg", "rightUpperLeg", "rightLowerLeg",
+):
+    segment = next((item for item in bones if item[0] == segment_name), None)
+    if not segment:
+        continue
+    _name, head, tail, _parent = segment
+    twist_name = segment_name + "Twist"
+    add_bone(twist_name, head.lerp(tail, 0.28), head.lerp(tail, 0.72), segment_name)
+    limb_twist_bones[twist_name] = {
+        "parent": segment_name,
+        "confidence": "medium" if (tail - head).length >= height * 0.075 else "low",
+        "method": "deform_helper_on_measured_limb_segment",
+        "note": "Control deformable manual; no distribuye torsión automáticamente.",
+    }
+
+
+def profile_sample_count(z):
+    return sum(1 for point in points if abs(point.z - z) <= height * 0.018)
+
+
+bone_landmark_diagnostics = {}
+
+
+def record_landmark(name, position, method, sample_count, confidence, note=None):
+    bone_landmark_diagnostics[name] = {
+        "position": [round(float(value), 5) for value in position],
+        "method": method,
+        "sample_count": int(sample_count),
+        "confidence": confidence,
+    }
+    if note:
+        bone_landmark_diagnostics[name]["note"] = note
+
+
+for name, z in (("hips", hip_z), ("spine", spine_z), ("chest", chest_z), ("neck", neck_z), ("head", head_z)):
+    samples = profile_sample_count(z)
+    profile_index = min(profile_bins - 1, max(0, int(((z - mins[2]) / height) * profile_bins)))
+    profile_ok = bool(profile[profile_index]["width"])
+    confidence = "medium" if samples >= 12 and profile_ok else "low"
+    method = "vertical_silhouette_profile" if profile_ok else "proportional_fallback"
+    bone = next((item for item in bones if item[0] == name), None)
+    record_landmark(name, bone[1] if bone else body_point(0, z), method, samples, confidence)
+
+for side in ("left", "right"):
+    arm = hand_landmark_diagnostics.get(side, {})
+    leg = leg_landmark_diagnostics.get(side, {})
+    component_count = arm_component_sizes.get(side, 0)
+    elbow_samples = arm.get("elbow_samples", 0)
+    wrist_confidence = "medium" if arm.get("method") == "minimum_robust_cross_section_v1" and arm.get("cross_section_samples", 0) >= 12 else "low"
+    for name, position, method, samples, confidence in (
+        (side + "Shoulder", next((item[1] for item in bones if item[0] == side + "Shoulder"), body_point(0, shoulder_z)), "torso_width_and_arm_component", component_count, "medium" if component_count >= 80 else "low"),
+        (side + "UpperArm", next((item[2] for item in bones if item[0] == side + "UpperArm"), body_point(0, shoulder_z)), "measured_arm_cross_section", elbow_samples, "medium" if elbow_samples >= 12 else "low"),
+        (side + "LowerArm", next((item[2] for item in bones if item[0] == side + "LowerArm"), body_point(0, shoulder_z)), arm.get("method", "proportional_fallback"), arm.get("cross_section_samples", 0), wrist_confidence),
+        (side + "Hand", next((item[2] for item in bones if item[0] == side + "Hand"), body_point(0, shoulder_z)), "palm_and_finger_tracks", hand_finger_track_counts.get(side, {}).get("candidate_vertices", 0), hand_finger_separation.get(side, {}).get("confidence", "low")),
+    ):
+        record_landmark(name, position, method, samples, confidence)
+
+    for name, position_key, method_key, sample_key in (
+        (side + "UpperLeg", "knee_position", "knee_method", "knee_samples"),
+        (side + "LowerLeg", "ankle_position", "ankle_method", "ankle_samples"),
+        (side + "Foot", "ball_position", "foot_method", "foot_samples"),
+        (side + "Toes", "toe_position", "foot_method", "foot_samples"),
+    ):
+        position = leg.get(position_key, [0, 0, 0])
+        samples = leg.get(sample_key, 0)
+        method = leg.get(method_key, "proportional_fallback")
+        confidence = "medium" if samples >= 12 and "fallback" not in method else "low"
+        record_landmark(name, position, method, samples, confidence)
+    # Reconstruct the reported finger landmarks from the already-created bone
+    # endpoints so the reviewer can inspect every falange from the bone list.
+    for digit in ("Index", "Middle", "Ring", "Little", "Thumb"):
+        prefix = side + digit
+        names = [prefix + suffix for suffix in ("Proximal", "Intermediate", "Distal")]
+        if digit == "Thumb":
+            names = [side + "ThumbMetacarpal", side + "ThumbProximal", side + "ThumbDistal"]
+        for bone_name in names:
+            bone = next((item for item in bones if item[0] == bone_name), None)
+            if not bone:
+                continue
+            finger_confidence = hand_finger_separation.get(side, {}).get("confidence", "low")
+            if hand_finger_layout_by_side.get(side) != "mesh_point_cloud":
+                finger_confidence = "low"
+            record_landmark(bone_name, bone[1], "measured_hand_track" if finger_confidence != "low" else "proportional_or_ambiguous_hand_track", hand_finger_track_counts.get(side, {}).get("candidate_vertices", 0), finger_confidence)
+for name, info in limb_twist_bones.items():
+    twist = next(item for item in bones if item[0] == name)
+    record_landmark(name, twist[1].lerp(twist[2], 0.5), info["method"], 0, info["confidence"], info["note"])
 
 arm_data = bpy.data.armatures.new("RigM_AutoRig")
 arm_obj = bpy.data.objects.new("RigM_AutoRig", arm_data)
@@ -791,9 +885,9 @@ except Exception as exc:
             segment["neighbors"] = [
                 candidate_index for candidate_index, candidate in enumerate(segments)
                 if candidate_index == segment_index
-                or candidate["parent"] == segment["parent"]
                 or candidate["parent"] == segment["name"]
                 or segment["parent"] == candidate["name"]
+                or (candidate["parent"] == segment["parent"] and (candidate["name"].endswith("Twist") or segment["name"].endswith("Twist")))
             ]
         for obj in meshes:
             for group in list(obj.vertex_groups):
@@ -828,7 +922,7 @@ def correct_head_and_arm_weights():
         "Shoulder", "UpperArm", "LowerArm", "Hand", "IndexProximal", "IndexIntermediate", "IndexDistal",
         "MiddleProximal", "MiddleIntermediate", "MiddleDistal", "RingProximal", "RingIntermediate",
         "RingDistal", "LittleProximal", "LittleIntermediate", "LittleDistal", "ThumbMetacarpal",
-        "ThumbProximal", "ThumbDistal",
+        "ThumbProximal", "ThumbDistal", "UpperArmTwist", "LowerArmTwist",
     ))]
     torso_names = [name for name in ("hips", "spine", "chest", "neck") if name in bone_by_name]
     head_corrected = 0
@@ -980,6 +1074,80 @@ def correct_head_and_arm_weights():
 weight_constraints = correct_head_and_arm_weights()
 
 
+def constrain_weights_to_local_bone_region():
+    """Prune skin influence from bones outside the nearest joint neighborhood."""
+    parent_by_name = {name: parent for name, _head, _tail, parent in bones}
+    children_by_name = {name: set() for name, _head, _tail, _parent in bones}
+    for name, parent in parent_by_name.items():
+        if parent in children_by_name:
+            children_by_name[parent].add(name)
+    segments = [(name, head, tail, parent) for name, head, tail, parent in bones]
+    corrected_vertices = 0
+    removed_weight = 0.0
+    total_vertices = 0
+
+    def distance(point, start, end):
+        direction = end - start
+        t = max(0.0, min(1.0, (point - start).dot(direction) / max(direction.length_squared, 1e-12)))
+        return (point - (start + direction * t)).length
+
+    def allowed_names(nearest_name):
+        allowed = {nearest_name, parent_by_name.get(nearest_name), *children_by_name.get(nearest_name, set())}
+        parent = parent_by_name.get(nearest_name)
+        # A twist helper and the segment siblings it refines form one local
+        # deformation neighborhood; unrelated branches never share weights.
+        if nearest_name.endswith("Twist") and parent:
+            allowed.update(children_by_name.get(parent, set()))
+        else:
+            for child in children_by_name.get(nearest_name, set()):
+                if child.endswith("Twist"):
+                    allowed.add(child)
+        return {name for name in allowed if name}
+
+    for obj in meshes:
+        groups = {index: group.name for index, group in enumerate(obj.vertex_groups)}
+        group_index = {name: index for index, name in groups.items()}
+        for vertex in obj.data.vertices:
+            total_vertices += 1
+            point = obj.matrix_world @ vertex.co
+            distances = [distance(point, head, tail) for _name, head, tail, _parent in segments]
+            nearest_index = min(range(len(segments)), key=distances.__getitem__)
+            allowed = allowed_names(segments[nearest_index][0])
+            original = {item.group: item.weight for item in vertex.groups if item.weight > 1e-10}
+            kept = {index: value for index, value in original.items() if groups.get(index) in allowed}
+            removed = sum(value for index, value in original.items() if groups.get(index) not in allowed)
+            if removed <= 1e-6:
+                continue
+            removed_weight += removed
+            if not kept:
+                nearest_group = group_index.get(segments[nearest_index][0])
+                if nearest_group is None:
+                    continue
+                kept = {nearest_group: 1.0}
+            # glTF skinning uses four influences; keep the strongest local
+            # influences and renormalize after removing distant regions.
+            strongest = sorted(kept.items(), key=lambda item: item[1], reverse=True)[:4]
+            total = sum(value for _index, value in strongest) or 1.0
+            for index in original:
+                if index not in {key for key, _value in strongest}:
+                    obj.vertex_groups[index].remove([vertex.index])
+            for index, value in strongest:
+                obj.vertex_groups[index].add([vertex.index], value / total, "REPLACE")
+            corrected_vertices += 1
+    return {
+        "method": "nearest_segment_topology_neighborhood_v1",
+        "vertex_count": total_vertices,
+        "corrected_vertex_count": corrected_vertices,
+        "corrected_vertex_ratio": round(corrected_vertices / max(total_vertices, 1), 5),
+        "removed_weight_sum": round(removed_weight, 5),
+        "max_influences": 4,
+        "note": "Los pesos se limitaron al hueso de segmento más cercano y a su vecindad padre/hijo; requiere revisión en solapes reales.",
+    }
+
+
+weight_region_validation = constrain_weights_to_local_bone_region()
+
+
 def ensure_complete_vertex_weights():
     """Repair uncovered vertices and normalize every vertex group sum."""
     segments = [(name, head, tail) for name, head, tail, _parent in bones]
@@ -1092,26 +1260,39 @@ def evaluate_pose_stress():
 
     pose_specs = []
     for name in arm_obj.pose.bones.keys():
-        if name.endswith(("Shoulder", "UpperArm", "LowerArm", "Hand", "UpperLeg", "LowerLeg", "Foot", "Toes")):
+        if name.endswith(("Shoulder", "UpperArm", "LowerArm", "Hand", "UpperLeg", "LowerLeg", "Foot", "Toes", "Twist")):
             # Probe each local rotation axis in both directions. This is a
             # structural stress test, not a claim that every pose is natural.
             angle = math.radians(
-                35 if name.endswith(("Shoulder", "UpperArm", "UpperLeg"))
+                20 if name.endswith("Twist")
+                else 35 if name.endswith(("Shoulder", "UpperArm", "UpperLeg"))
                 else 30 if name.endswith("Hand")
                 else 25 if name.endswith(("Foot", "Toes"))
                 else 55
             )
             for axis in range(3):
                 for sign in (-1, 1):
-                    pose_specs.append((name, axis, sign * angle))
+                    pose_specs.append((name, "XYZ"[axis], [(name, axis, sign * angle)]))
+
+    # Local-axis combinations expose failures that isolated joint tests miss.
+    combo_specs = [
+        ("left_arm_chain", "combo", [("leftShoulder", 0, math.radians(18)), ("leftUpperArm", 1, math.radians(-32)), ("leftLowerArm", 0, math.radians(48))]),
+        ("right_arm_chain", "combo", [("rightShoulder", 0, math.radians(-18)), ("rightUpperArm", 1, math.radians(32)), ("rightLowerArm", 0, math.radians(-48))]),
+        ("left_leg_chain", "combo", [("leftUpperLeg", 0, math.radians(24)), ("leftLowerLeg", 0, math.radians(38)), ("leftFoot", 1, math.radians(-12))]),
+        ("right_leg_chain", "combo", [("rightUpperLeg", 0, math.radians(-24)), ("rightLowerLeg", 0, math.radians(-38)), ("rightFoot", 1, math.radians(12))]),
+    ]
+    pose_specs.extend(combo_specs)
 
     results = []
-    for bone_name, axis, angle in pose_specs:
-        pose_bone = arm_obj.pose.bones[bone_name]
-        pose_bone.rotation_mode = "XYZ"
-        rotation = [0.0, 0.0, 0.0]
-        rotation[axis] = angle
-        pose_bone.rotation_euler = rotation
+    for bone_name, axis_name, rotations in pose_specs:
+        for name, axis, angle in rotations:
+            pose_bone = arm_obj.pose.bones.get(name)
+            if pose_bone is None:
+                continue
+            pose_bone.rotation_mode = "XYZ"
+            rotation = [0.0, 0.0, 0.0]
+            rotation[axis] = angle
+            pose_bone.rotation_euler = rotation
         bpy.context.view_layer.update()
         depsgraph = bpy.context.evaluated_depsgraph_get()
         ratios = []
@@ -1136,7 +1317,10 @@ def evaluate_pose_stress():
                 if max((current[first] - baseline[first]).length, (current[second] - baseline[second]).length) > height * 1e-5:
                     affected_ratios.append(ratio)
             evaluated.to_mesh_clear()
-        pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+        for name, _axis, _angle in rotations:
+            pose_bone = arm_obj.pose.bones.get(name)
+            if pose_bone:
+                pose_bone.rotation_euler = (0.0, 0.0, 0.0)
         if ratios:
             ratios.sort()
             severe = sum(value < 0.65 or value > 1.55 for value in ratios)
@@ -1146,8 +1330,9 @@ def evaluate_pose_stress():
             affected_severe = sum(value < 0.65 or value > 1.55 for value in affected_ratios) / max(1, len(affected_ratios))
             results.append({
                 "bone": bone_name,
-                "axis": "XYZ"[axis],
-                "degrees": round(math.degrees(angle), 1),
+                "axis": axis_name,
+                "degrees": [round(math.degrees(angle), 1) for _name, _axis, angle in rotations] if len(rotations) > 1 else round(math.degrees(rotations[0][2]), 1),
+                "rotations": [{"bone": name, "axis": "XYZ"[axis], "degrees": round(math.degrees(angle), 1)} for name, axis, angle in rotations],
                 "edge_ratio_p95": round(p95, 3),
                 "edge_ratio_p99": round(p99, 3),
                 "severe_edge_fraction": round(severe_fraction, 5),
@@ -1159,11 +1344,12 @@ def evaluate_pose_stress():
     bpy.context.view_layer.update()
     failed = [item for item in results if not item["passed"]]
     return {
-        "method": "blender_pose_edge_seam_stress_v4_limbs",
+        "method": "blender_pose_edge_seam_stress_v5_combined_twist",
         "seam_group_count": sum(map(len, seam_groups.values())),
         "limitations": ["No detecta penetraciones entre superficies ni separación entre objetos distintos.",
                         "Las uniones medidas son vértices coincidentes en reposo; no equivalen a una revisión visual.",
-                        "La prueba de muñeca rota el hueso Hand en tres ejes; no valida por sí sola la ubicación anatómica del pivote."],
+                        "La prueba de muñeca rota el hueso Hand en tres ejes; no valida por sí sola la ubicación anatómica del pivote.",
+                        "Las poses combinadas son estrés local por ejes XYZ, no capturas de movimiento anatómicamente validadas."],
         "pose_count": len(results),
         "passed": bool(results) and not failed,
         "failed_pose_count": len(failed),
@@ -1194,22 +1380,27 @@ wrist_geometry_ok = all(
     values.get("sampled_vertices", 0) >= 12
     for values in weight_constraints.get("wrist_weight_statistics", {}).values()
 )
+landmark_quality_ok = all(item.get("confidence") != "low" for name, item in bone_landmark_diagnostics.items() if not name.endswith("Twist"))
+weight_regions_ok = weight_region_validation["corrected_vertex_ratio"] <= 0.12
 report = {
-    "algorithm": "silhouette_proportions_v2",
+    "algorithm": "silhouette_landmarks_with_confidence_v3",
     "weighting": weights_method,
     "hand_bone_layout": "connected_arm_surface_v3",
     "hand_finger_layout_by_side": hand_finger_layout_by_side,
     "arm_component_vertex_count": arm_component_sizes,
     "hand_landmark_diagnostics": hand_landmark_diagnostics,
     "leg_landmark_diagnostics": leg_landmark_diagnostics,
+    "bone_landmark_diagnostics": bone_landmark_diagnostics,
+    "limb_twist_bones": limb_twist_bones,
     "hand_finger_track_detection": hand_finger_track_counts,
     "hand_finger_separation": hand_finger_separation,
     "thumb_layout_method": "palm_local_measured_finger_scale_v2",
     "forward_axis": input_forward_axis,
     "normalized_forward_axis": "-Y",
-    "confidence": "medium" if shape_ok and hand_geometry_ok and wrist_geometry_ok and weights_method in {"blender_automatic_weights", "blender_automatic_weights_welded_proxy"} and deformation_validation["passed"] and weight_coverage["repaired_vertex_count"] == 0 else "low",
+    "confidence": "medium" if shape_ok and hand_geometry_ok and wrist_geometry_ok and landmark_quality_ok and weight_regions_ok and weights_method in {"blender_automatic_weights", "blender_automatic_weights_welded_proxy"} and deformation_validation["passed"] and weight_coverage["repaired_vertex_count"] == 0 else "low",
     "deformation_validation": deformation_validation,
     "weight_constraints": weight_constraints,
+    "weight_region_validation": weight_region_validation,
     "weight_coverage": weight_coverage,
     "seam_weight_repair": seam_weight_repair,
     "weight_proxy": weight_proxy_stats,
@@ -1240,6 +1431,12 @@ if any(item.get("confidence") == "low" for item in hand_finger_separation.values
     report["warnings"].append("La confianza global se redujo porque la detección de dedos no pudo confirmar regiones anatómicas separadas.")
 if not wrist_geometry_ok:
     report["warnings"].append("La geometría no aportó suficientes vértices cerca de una o ambas muñecas; verifica manualmente los pesos de palma y antebrazo.")
+low_landmarks = [name for name, item in bone_landmark_diagnostics.items() if item.get("confidence") == "low" and not name.endswith("Twist")]
+if low_landmarks:
+    report["warnings"].append("Pivotes con evidencia geométrica baja: " + ", ".join(low_landmarks) + ". Revísalos en el visor antes de animar.")
+if not weight_regions_ok:
+    report["warnings"].append("Se encontraron influencias fuera de la vecindad anatómica local en más del 12% de vértices; la corrección geométrica necesita revisión visual.")
+report["warnings"].append("Se añadieron controles deformables Twist para segmentos largos; son opcionales y requieren animación manual para distribuir torsión.")
 if any("ambiguous_cross_section" in item.get("method", "") for item in hand_landmark_diagnostics.values()):
     report["warnings"].append("La sección geométrica de la muñeca no fue concluyente; el pivote usa el percentil 65 del brazo conectado y requiere comprobación visual contra el puño de la manga.")
 report["warnings"].extend(deformation_validation["warnings"])
