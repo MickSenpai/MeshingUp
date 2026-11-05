@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rigm"
+name = "meshingup"
 version = "0.1.0"
 description = "Editor de rigging 2D y avatares 3D GLB/VRM con animación reactiva"
 readme = "README.md"
@@ -18,11 +18,11 @@ decomposition = ["gradio_client>=1.6", "psd-tools>=1.9"]
 avatar3d = ["PyQt6-WebEngine>=6.7,<6.12"]
 
 [project.scripts]
-rigm = "rigm.app:main"
-rigmctl = "rigm.cli:main"
+meshingup = "meshingup.app:main"
+meshingupctl = "meshingup.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-rigm = ["viewer3d_static/*"]
+meshingup = ["viewer3d_static/*"]

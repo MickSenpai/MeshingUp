@@ -55,7 +55,7 @@ class BehaviorRuntime:
         self.speech_input_until = 0.0
         self.gesture_clip: dict[str, Any] | None = None
         self.gesture_time = 0.0
-        self._rng = random.Random(seed if seed is not None else str(project.get("id", project.get("name", "rigm"))))
+        self._rng = random.Random(seed if seed is not None else str(project.get("id", project.get("name", "meshingup"))))
         self._next_blink = self._rng.uniform(2.0, 4.8)
         self._blink_time = -1.0
         self._next_fidget = self._rng.uniform(2.8, 5.2)

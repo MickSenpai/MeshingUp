@@ -1,24 +1,25 @@
-# Instrucciones para agentes de RigM
+# Instrucciones para agentes de MeshingUp
 
-RigM es una aplicación de escritorio para convertir ilustraciones en personajes 2D articulados. La visión completa es que un agente de IA pueda gestionar un proyecto de principio a fin y que la interfaz muestre rigs, estados, progreso, evidencias y errores verificables.
+MeshingUp es una aplicación de escritorio para convertir ilustraciones en personajes 2D articulados. La visión completa es que un agente de IA pueda gestionar un proyecto de principio a fin y que la interfaz muestre rigs, estados, progreso, evidencias y errores verificables.
 
 ## Estado real del producto
 
-- Editor PyQt6: importa una imagen, coloca/mueve pivotes, conecta huesos, crea y pinta máscaras monocromas, abre y guarda `.rigm` portable.
-- Biblioteca: registra proyectos, descubre `.rigm` en `~/RigM/Projects`, marca archivos e imágenes ausentes y muestra etapa/estado/progreso/conteo de capas.
-- `rigmctl`: CLI estructurada para crear, inspeccionar, validar y modificar proyectos, pivotes, huesos, capas, máscaras, sprites extraídos, reconstrucciones, clips 2D y animaciones GLB creadas con Blender. Usa operaciones compartidas con la interfaz y registra historial.
+- Editor PyQt6: importa una imagen, coloca/mueve pivotes, conecta huesos, crea y pinta máscaras monocromas, abre y guarda `.meshingup` portable.
+- Biblioteca: registra proyectos, descubre `.meshingup` en `~/MeshingUp/Projects`, marca archivos e imágenes ausentes y muestra etapa/estado/progreso/conteo de capas.
+- `meshingupctl`: CLI estructurada para crear, inspeccionar, validar y modificar proyectos, pivotes, huesos, capas, máscaras, sprites extraídos, reconstrucciones, clips 2D y animaciones GLB creadas con Blender. Usa operaciones compartidas con la interfaz y registra historial.
 - La biblioteca detecta cambios externos y el editor impide sobrescribirlos sin recargar.
-- Las máscaras se crean vacías y se pintan a mano o se importan desde PNG; SAM 2 local propone tres candidatos mediante puntos/cajas y requiere aceptación explícita. Instala `.[segmentation]` para PyTorch/Transformers y `.[inpaint]` para OpenCV. RigM también ofrece mallas/pesos, deformaciones, expresiones, clips y exportadores.
-- El flujo 3D recomendado usa Blender para generar huesos y pesos automáticos; RigM abre su visor para probar clips base, editar pivotes y guardar GLB. Conserva la fuente y solicita revisión visual. El auto-rig geométrico Three.js sigue disponible como alternativa experimental sin Blender. Las señales de visemas/TTS deben venir de una integración externa.
-- `rigmctl avatar3d analyze-parts` y la interfaz pueden inventariar islas desconectadas y proponer regiones corporales/candidatos faciales con confianza explícita. No presentes propuestas heurísticas como separación semántica confirmada; conserva el hash fuente y solicita revisión antes de extraer.
+- Las máscaras se crean vacías y se pintan a mano o se importan desde PNG; SAM 2 local propone tres candidatos mediante puntos/cajas y requiere aceptación explícita. Instala `.[segmentation]` para PyTorch/Transformers y `.[inpaint]` para OpenCV. MeshingUp también ofrece mallas/pesos, deformaciones, expresiones, clips y exportadores.
+- El flujo 3D recomendado usa Blender para generar huesos y pesos automáticos; MeshingUp abre su visor para probar clips base, editar pivotes y guardar GLB. Conserva la fuente y solicita revisión visual. El auto-rig geométrico Three.js sigue disponible como alternativa experimental sin Blender. Las señales de visemas/TTS deben venir de una integración externa.
+- `meshingupctl avatar3d repair` suelda costuras duplicadas y quita geometría muerta de un GLB sin rig (el original se conserva y queda registrado); `meshingupctl avatar3d auto` encadena reparación, auto-rig Blender y clips base, actualiza etapa/progreso en el manifiesto y siempre termina en `needs_review`. No declares `ready` tras `auto`: exige revisión visual de poses.
+- `meshingupctl avatar3d analyze-parts` y la interfaz pueden inventariar islas desconectadas y proponer regiones corporales/candidatos faciales con confianza explícita. No presentes propuestas heurísticas como separación semántica confirmada; conserva el hash fuente y solicita revisión antes de extraer.
 - Los proyectos 3D-only pueden omitir `image` e `image_size`, pero deben incluir un avatar GLB/VRM válido. No hagas obligatoria la imagen 2D para abrir o editar ese avatar.
 - No declarar un proyecto como `ready` si la validación informa pendientes.
 
 ## Reglas de arquitectura
 
-1. `rigm.project` es la fuente de verdad para lectura, escritura, validación y operaciones del modelo. La interfaz y los agentes no deben mantener formatos diferentes.
-2. Toda operación de agente debe tener argumentos estructurados, resultados JSON, errores claros, historial y cambios atómicos. Añade cada capacidad a `rigmctl` sin automatizar clics de interfaz.
-3. Mantén el `.rigm` versionado, portable y con rutas relativas. Migra formatos previos cuando cambie el esquema; no pierdas archivos de usuario.
+1. `meshingup.project` es la fuente de verdad para lectura, escritura, validación y operaciones del modelo. La interfaz y los agentes no deben mantener formatos diferentes.
+2. Toda operación de agente debe tener argumentos estructurados, resultados JSON, errores claros, historial y cambios atómicos. Añade cada capacidad a `meshingupctl` sin automatizar clics de interfaz.
+3. Mantén el `.meshingup` versionado, portable y con rutas relativas. Migra formatos previos cuando cambie el esquema; no pierdas archivos de usuario.
 4. Registra etapa, estado, progreso, identificador de tarea y último resultado en el manifiesto para que la biblioteca pueda supervisar el trabajo.
 5. Las inferencias de IA deben seguir siendo editables, conservar la fuente y distinguir reconstrucciones de píxeles observados.
 6. El estado `ready` requiere que todas las validaciones obligatorias pasen; no lo fuerces para que la interfaz se vea completa.
@@ -28,14 +29,14 @@ RigM es una aplicación de escritorio para convertir ilustraciones en personajes
 
 ## Desarrollo y operación
 
-Instalar el paquete desde la raíz del proyecto con `python -m pip install -e .`. El editor se inicia con `rigm`; las operaciones para agentes se consultan con `rigmctl --help`.
+Instalar el paquete desde la raíz del proyecto con `python -m pip install -e .`. El editor se inicia con `meshingup`; las operaciones para agentes se consultan con `meshingupctl --help`.
 
 Comandos útiles desde la raíz:
 
 ```bash
-rigmctl list --json
-rigmctl validate /ruta/al/personaje.rigm
-rigmctl inspect /ruta/al/personaje.rigm
+meshingupctl list --json
+meshingupctl validate /ruta/al/personaje.meshingup
+meshingupctl inspect /ruta/al/personaje.meshingup
 ```
 
 Para cambios de lógica del proyecto, valida el flujo CLI con un directorio temporal y abre una ventana Qt en modo offscreen cuando no haya escritorio disponible. No dejes imágenes o proyectos de smoke test en la biblioteca real.

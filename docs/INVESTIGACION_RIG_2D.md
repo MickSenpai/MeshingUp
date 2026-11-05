@@ -1,20 +1,20 @@
 # Investigación: qué necesita un buen rig 2D desde una ilustración
 
 **Fecha de revisión:** 2026-10-29  
-**Aplicación:** RigM  
+**Aplicación:** MeshingUp  
 **Objetivo:** convertir una imagen estática en un personaje 2D articulado, expresivo y revisable, sin ocultar los límites de reconstruir información desde una sola imagen.
 
 ## Contexto persistente para continuar el proyecto
 
-La persona usuaria quiere que RigM tenga una interfaz gráfica para comprobar qué rigs existen y cuáles se están trabajando, y que la IA pueda manejar el proceso completo. La meta es importar una imagen, preparar arte y capas, construir y animar el rig, validarlo, corregir defectos y exportarlo. El catálogo debe mostrar estados y evidencia reales del disco; la automatización debe usar operaciones estructuradas del proyecto, registrar historial y poder pausarse, deshacerse y retomarse. No describir la IA como infalible: debe distinguir resultados confirmados de reconstrucciones inferidas y enseñar claramente los casos inciertos.
+La persona usuaria quiere que MeshingUp tenga una interfaz gráfica para comprobar qué rigs existen y cuáles se están trabajando, y que la IA pueda manejar el proceso completo. La meta es importar una imagen, preparar arte y capas, construir y animar el rig, validarlo, corregir defectos y exportarlo. El catálogo debe mostrar estados y evidencia reales del disco; la automatización debe usar operaciones estructuradas del proyecto, registrar historial y poder pausarse, deshacerse y retomarse. No describir la IA como infalible: debe distinguir resultados confirmados de reconstrucciones inferidas y enseñar claramente los casos inciertos.
 
-Estado actual: RigM incluye biblioteca PyQt6, máscaras y propuestas locales SAM 2, extracción de sprites, mallas, pesos, deformación, IK, expresiones, clips, validación y bundle portable. Para automatizar la separación de ilustraciones anime se integró See-through como servicio de nube opcional: la app pide permiso antes de enviar la imagen, recupera su PSD y crea capas semánticas editables. La integración conserva el original y el PSD de evidencia. No se ha ejecutado aún See-through sobre Meido desde RigM; la revisión con el parser de ropa de fotografías mostró que no separa bien las mangas pixel art, motivo para usar un modelo entrenado para anime. El hardware local no expone CUDA, así que la generación completa local no está disponible en esta instalación. Siguen pendientes la revisión visual automática, el coordinador autónomo, generación automática de rigs/animaciones, y exportación nativa Rive/Live2D/Spine.
+Estado actual: MeshingUp incluye biblioteca PyQt6, máscaras y propuestas locales SAM 2, extracción de sprites, mallas, pesos, deformación, IK, expresiones, clips, validación y bundle portable. Para automatizar la separación de ilustraciones anime se integró See-through como servicio de nube opcional: la app pide permiso antes de enviar la imagen, recupera su PSD y crea capas semánticas editables. La integración conserva el original y el PSD de evidencia. No se ha ejecutado aún See-through sobre Meido desde MeshingUp; la revisión con el parser de ropa de fotografías mostró que no separa bien las mangas pixel art, motivo para usar un modelo entrenado para anime. El hardware local no expone CUDA, así que la generación completa local no está disponible en esta instalación. Siguen pendientes la revisión visual automática, el coordinador autónomo, generación automática de rigs/animaciones, y exportación nativa Rive/Live2D/Spine.
 
 ## Conclusión de diseño
 
 Un rig convincente no sale de poner huesos encima de un JPG. Antes hay que convertir la imagen en materiales independientes, reconstruir lo que la pose original ocultaba, definir qué partes son rígidas y cuáles se deforman, y comprobar el personaje en sus poses límite. La documentación de Live2D describe ese mismo orden: separar las partes que se moverán, añadir las zonas que quedarán visibles al moverlas y después modelar y animar. [Flujo de producción de Live2D](https://docs.live2d.com/en/cubism-editor-manual/workflow/)
 
-RigM debe automatizar propuestas, conservar cada paso editable y poner la revisión visual en el centro. Desde una imagen no se puede saber con certeza cómo se ve la espalda de un brazo tapado o el cabello detrás del torso. El sistema puede inferir una continuación plausible, pero debe marcarla como reconstrucción y permitir corregirla.
+MeshingUp debe automatizar propuestas, conservar cada paso editable y poner la revisión visual en el centro. Desde una imagen no se puede saber con certeza cómo se ve la espalda de un brazo tapado o el cabello detrás del torso. El sistema puede inferir una continuación plausible, pero debe marcarla como reconstrucción y permitir corregirla.
 
 ## 1. Qué significa “correcto”
 
@@ -34,9 +34,9 @@ La fidelidad a la pose de reposo es un requisito medible: al reconstruir las cap
 
 ### Descomposición anime de una sola imagen
 
-Para anime y personajes estilizados, RigM ofrece una ruta de descomposición completa mediante [See-through](https://github.com/shitagaki-lab/see-through), un proyecto de investigación que genera hasta 23 capas semánticas, orden de dibujo, capas transparentes e inferencia de profundidad. Su pipeline combina generación de capas e inpainting con un modelo de profundidad anime y exporta PSD. El espacio público está alojado en [Hugging Face](https://huggingface.co/spaces/24yearsold/see-through-demo); RigM importa el PSD como piezas y ajusta el padding del lienzo para no recortar una ilustración vertical.
+Para anime y personajes estilizados, MeshingUp ofrece una ruta de descomposición completa mediante [See-through](https://github.com/shitagaki-lab/see-through), un proyecto de investigación que genera hasta 23 capas semánticas, orden de dibujo, capas transparentes e inferencia de profundidad. Su pipeline combina generación de capas e inpainting con un modelo de profundidad anime y exporta PSD. El espacio público está alojado en [Hugging Face](https://huggingface.co/spaces/24yearsold/see-through-demo); MeshingUp importa el PSD como piezas y ajusta el padding del lienzo para no recortar una ilustración vertical.
 
-El servicio envía la imagen fuera del equipo, por eso RigM solicita confirmación en cada ejecución. El espacio requiere sesión de Hugging Face y tiene límites de disponibilidad/cuota; la revisión del resultado sigue siendo obligatoria. El repo indica que la inferencia local a 1280 px puede requerir 12–16 GB de VRAM, por lo que el backend remoto es la opción práctica cuando el equipo no dispone de GPU compatible. La integración de RigM aún debe verificarse con la salida real de Meido antes de considerar correcto el orden, las máscaras y el inpainting.
+El servicio envía la imagen fuera del equipo, por eso MeshingUp solicita confirmación en cada ejecución. El espacio requiere sesión de Hugging Face y tiene límites de disponibilidad/cuota; la revisión del resultado sigue siendo obligatoria. El repo indica que la inferencia local a 1280 px puede requerir 12–16 GB de VRAM, por lo que el backend remoto es la opción práctica cuando el equipo no dispone de GPU compatible. La integración de MeshingUp aún debe verificarse con la salida real de Meido antes de considerar correcto el orden, las máscaras y el inpainting.
 
 ### Entrada y análisis
 
@@ -81,7 +81,7 @@ Una solución IK de dos huesos resulta útil para colocar una mano o un pie en u
 
 ## 4. Cara y expresiones
 
-La cara requiere una ruta de trabajo propia: pelo frontal/trasero, blanco del ojo, iris/pupila, párpados, cejas, nariz, boca y sombras/reflejos si están dibujados. Si la fuente sólo contiene una cara, RigM tendrá que separar esos rasgos y reconstruir las zonas que estaban detrás. Si la escala de la imagen no permite una separación limpia, debe avisarlo y pedir una fuente mejor o permitir dibujar variantes.
+La cara requiere una ruta de trabajo propia: pelo frontal/trasero, blanco del ojo, iris/pupila, párpados, cejas, nariz, boca y sombras/reflejos si están dibujados. Si la fuente sólo contiene una cara, MeshingUp tendrá que separar esos rasgos y reconstruir las zonas que estaban detrás. Si la escala de la imagen no permite una separación limpia, debe avisarlo y pedir una fuente mejor o permitir dibujar variantes.
 
 Parámetros base recomendados:
 
@@ -99,7 +99,7 @@ Para una entrada JPG, cada rasgo necesita verificación visual al 100 % y al tam
 
 Una animación se diseña con poses legibles y propósito, no haciendo oscilar todas las articulaciones a la vez. Disney Animation destaca timing, staging claro, anticipación, seguimiento y acción secundaria; Spine separa el bloqueo de poses principales del refinamiento de curvas y timing. [Principios de Disney Animation](https://disneyanimation.com/process/animation/) · [Flujo pose a pose y curvas de Spine](https://esotericsoftware.com/spine-first-steps)
 
-Reglas prácticas para RigM:
+Reglas prácticas para MeshingUp:
 
 1. **Bloquear primero las poses clave.** Inicio de acción, pose máxima, recuperación. Revisar siluetas antes de añadir interpolación.
 2. **Dar masa al torso.** El centro de masa guía pelvis, caja torácica, cabeza y extremidades. Las piernas sostienen el peso; no deben oscilar sin desplazar el torso.
@@ -118,7 +118,7 @@ El reposo también necesita vida, pero de baja amplitud: respiración asimétric
 
 Un modelo interactivo de segmentación puede proponer máscara por puntos, caja, ejemplo visual o texto. SAM 2 admite prompts visuales y SAM 3 añade prompts de concepto con texto/ejemplos; ninguno de esos hechos garantiza máscaras perfectas de piezas anatómicas en arte estilizado. [Investigación SAM 2](https://ai.meta.com/research/publications/sam-2-segment-anything-in-images-and-videos/) · [SAM 3 y prompts de concepto](https://ai.meta.com/research/publications/sam-3-segment-anything-with-concepts/)
 
-En RigM, la IA debe entregar candidatos con confianza y permitir sumar/restar máscara mediante clics, pincel, lazo y refinamiento de borde. Primero localizar al personaje; después proponer sus componentes en contexto. Mantener agujas, cabellos finos y contornos semitransparentes como zonas de incertidumbre, no convertirlos a alfa binario sin opción.
+En MeshingUp, la IA debe entregar candidatos con confianza y permitir sumar/restar máscara mediante clics, pincel, lazo y refinamiento de borde. Primero localizar al personaje; después proponer sus componentes en contexto. Mantener agujas, cabellos finos y contornos semitransparentes como zonas de incertidumbre, no convertirlos a alfa binario sin opción.
 
 ### Pose y pivotes
 
@@ -130,7 +130,7 @@ Relleno clásico, inpainting especializado e inpainting generativo tienen difere
 
 SAM 3 tiene requisitos técnicos considerables en su repositorio oficial (Python/PyTorch recientes y, para su configuración documentada, CUDA compatible). Conviene aislar estos modelos como componentes opcionales, instalables bajo demanda, y mantener el editor y los flujos manuales operativos sin GPU. Revisar licencia de pesos y condiciones de distribución antes de empaquetar o vender cualquier modelo. [Repositorio y requisitos de SAM 3](https://github.com/facebookresearch/sam3)
 
-## 7. Diseño del producto RigM
+## 7. Diseño del producto MeshingUp
 
 La interfaz debe presentar un flujo reversible con etapas visibles:
 
@@ -146,7 +146,7 @@ Los cambios de IA son operaciones con historial y máscaras guardadas. La person
 
 ### Biblioteca de rigs y operación autónoma
 
-RigM también necesita una pantalla inicial de biblioteca, además del editor de cada personaje. Debe mostrar qué proyectos existen realmente en disco, cuál está en curso, qué etapa completó cada uno, cuándo cambió por última vez, qué versión de la fuente/modelo usa y si necesita atención. Cada ficha debería ofrecer miniatura, nombre, estado, progreso, último resultado y errores; abrir, continuar, duplicar, archivar y localizar el archivo. El catálogo se reconstruye desde manifiestos `.rigm` para que no afirme que existe un rig cuyo archivo falta. Los trabajos largos aparecen en una cola con pasos, tiempo, artefactos y logs legibles.
+MeshingUp también necesita una pantalla inicial de biblioteca, además del editor de cada personaje. Debe mostrar qué proyectos existen realmente en disco, cuál está en curso, qué etapa completó cada uno, cuándo cambió por última vez, qué versión de la fuente/modelo usa y si necesita atención. Cada ficha debería ofrecer miniatura, nombre, estado, progreso, último resultado y errores; abrir, continuar, duplicar, archivar y localizar el archivo. El catálogo se reconstruye desde manifiestos `.meshingup` para que no afirme que existe un rig cuyo archivo falta. Los trabajos largos aparecen en una cola con pasos, tiempo, artefactos y logs legibles.
 
 La IA debe poder completar el flujo sin obligar a la persona a operar manualmente las herramientas: importar y analizar la fuente; proponer y refinar máscaras; reconstruir oclusiones; crear capas, huesos, mallas y pesos; riggear cara; generar clips y expresiones; renderizar poses límite; ejecutar validación estructural y visual; corregir defectos detectables; y preparar exportaciones. La UI permite observarlo, revisar versiones y dirigirlo con instrucciones naturales. El control debe usar las mismas operaciones de dominio que usa el editor, no automatización frágil de clics sobre la interfaz.
 
@@ -160,7 +160,7 @@ La validación autónoma tiene tres niveles: (1) estructural: referencias, ciclo
 
 ## 8. Formato de proyecto y evaluación
 
-El formato `.rigm` debe evolucionar a un contenedor versionado con identificadores estables y rutas relativas. Separar al menos:
+El formato `.meshingup` debe evolucionar a un contenedor versionado con identificadores estables y rutas relativas. Separar al menos:
 
 - fuente y metadatos;
 - capas raster/vectoriales y máscaras;
@@ -172,7 +172,7 @@ El formato `.rigm` debe evolucionar a un contenedor versionado con identificador
 - clips, claves, curvas, loops y mezclas;
 - historial y versión del formato.
 
-No acoplar el modelo interno a un único exportador. Rive, Live2D, Inochi2D o un runtime propio representan estructuras diferentes; crear adaptadores y reportar las funciones que se pierden al exportar. Mantener el `.rigm` como fuente editable.
+No acoplar el modelo interno a un único exportador. Rive, Live2D, Inochi2D o un runtime propio representan estructuras diferentes; crear adaptadores y reportar las funciones que se pierden al exportar. Mantener el `.meshingup` como fuente editable.
 
 ### Puertas de calidad
 

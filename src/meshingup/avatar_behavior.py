@@ -1,4 +1,4 @@
-"""Event planner shared by RigM's 2D and optional humanoid avatar runtimes."""
+"""Event planner shared by MeshingUp's 2D and optional humanoid avatar runtimes."""
 
 from __future__ import annotations
 

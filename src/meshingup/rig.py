@@ -102,7 +102,7 @@ def _vision_dependencies():
         import cv2
         import numpy as np
     except ImportError as exc:
-        raise ProjectError("La malla deformable requiere OpenCV. Instala RigM con: pip install -e '.[rigging]'") from exc
+        raise ProjectError("La malla deformable requiere OpenCV. Instala MeshingUp con: pip install -e '.[rigging]'") from exc
     return cv2, np
 
 

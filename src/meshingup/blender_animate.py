@@ -8,7 +8,7 @@ from mathutils import Euler
 
 
 def fail(message):
-    print("RIGM_ANIMATION_ERROR: " + message, file=sys.stderr)
+    print("MESHINGUP_ANIMATION_ERROR: " + message, file=sys.stderr)
     raise RuntimeError(message)
 
 
@@ -25,6 +25,10 @@ scene = bpy.context.scene
 # before import so old clips keep their real duration if fps changes.
 scene.render.fps = fps
 scene.render.fps_base = 1.0
+# Start from an empty scene: --factory-startup adds a default Cube/Light/Camera
+# that would otherwise be analysed or exported as if it belonged to the model.
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete(use_global=False)
 try:
     bpy.ops.import_scene.gltf(filepath=source_path)
 except Exception as exc:
@@ -104,4 +108,4 @@ report = {
 }
 with open(report_path, "w", encoding="utf-8") as report_file:
     json.dump(report, report_file, ensure_ascii=False, indent=2)
-print("RIGM_ANIMATION_COMPLETE: " + json.dumps(report, ensure_ascii=False))
+print("MESHINGUP_ANIMATION_COMPLETE: " + json.dumps(report, ensure_ascii=False))

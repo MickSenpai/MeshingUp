@@ -1,4 +1,4 @@
-"""Structured command interface for people and AI agents operating RigM."""
+"""Structured command interface for people and AI agents operating MeshingUp."""
 
 from __future__ import annotations
 
@@ -36,11 +36,11 @@ from .export import export_bundle
 from .rig import generate_layer_mesh, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .decomposition import decompose_project_with_see_through
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES, motion_event_from_agent
-from .avatar3d import analyze_avatar_parts, animate_avatar3d, attach_avatar, autorig_glb, validate_project_avatar, validate_glb, validate_vrm
+from .avatar3d import ANIMATION_PRESETS, analyze_avatar_parts, animate_avatar3d, attach_avatar, auto_prepare_avatar, autorig_glb, repair_avatar_mesh, validate_project_avatar, validate_glb, validate_vrm
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rigmctl", description="Operaciones estructuradas para RigM y agentes de IA.")
+    parser = argparse.ArgumentParser(prog="meshingupctl", description="Operaciones estructuradas para MeshingUp y agentes de IA.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     listing = sub.add_parser("list", help="Lista proyectos registrados y valida si existen.")
@@ -191,6 +191,17 @@ def _parser() -> argparse.ArgumentParser:
     avatar_autorig.add_argument("project")
     avatar_autorig.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
     avatar_autorig.add_argument("--forward-axis", choices=("-Y", "+Y", "-X", "+X"), default="-Y")
+    avatar_repair = avatar_sub.add_parser("repair", help="Suelda costuras duplicadas y quita geometría muerta del GLB con Blender; conserva el original.")
+    avatar_repair.add_argument("project")
+    avatar_repair.add_argument("--min-island-vertices", type=int, default=0, help="Elimina islas con menos vértices que este valor. 0 (por defecto) sólo las informa.")
+    avatar_repair.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, detecta PATH o Flatpak.")
+    avatar_auto = avatar_sub.add_parser("auto", help="Repara la malla, crea huesos y pesos y añade animaciones base; termina en needs_review.")
+    avatar_auto.add_argument("project")
+    avatar_auto.add_argument("--forward-axis", choices=("-Y", "+Y", "-X", "+X"), default="-Y")
+    avatar_auto.add_argument("--clips", default=",".join(ANIMATION_PRESETS), help="Animaciones base separadas por comas (" + ", ".join(ANIMATION_PRESETS) + ") o 'none'.")
+    avatar_auto.add_argument("--skip-repair", action="store_true", help="Riggea el GLB tal como está, sin repararlo.")
+    avatar_auto.add_argument("--min-island-vertices", type=int, default=0)
+    avatar_auto.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, detecta PATH o Flatpak.")
     avatar_parts = avatar_sub.add_parser("analyze-parts", help="Detecta islas extraíbles y propone regiones corporales en un GLB usando Blender.")
     avatar_parts.add_argument("project")
     avatar_parts.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
@@ -360,6 +371,14 @@ def main() -> None:
         elif args.command == "avatar3d" and args.avatar_action == "autorig":
             result = autorig_glb(args.project, blender_path=args.blender, forward_axis=args.forward_axis, actor="agent")
             _emit(result)
+        elif args.command == "avatar3d" and args.avatar_action == "repair":
+            _emit(repair_avatar_mesh(args.project, blender_path=args.blender, min_island_vertices=args.min_island_vertices, actor="agent"))
+        elif args.command == "avatar3d" and args.avatar_action == "auto":
+            clips = [] if args.clips.strip().casefold() == "none" else [item.strip() for item in args.clips.split(",") if item.strip()]
+            _emit(auto_prepare_avatar(
+                args.project, blender_path=args.blender, forward_axis=args.forward_axis, repair=not args.skip_repair,
+                min_island_vertices=args.min_island_vertices, clips=clips, actor="agent",
+            ))
         elif args.command == "avatar3d" and args.avatar_action == "analyze-parts":
             result = analyze_avatar_parts(args.project, blender_path=args.blender, forward_axis=args.forward_axis, actor="agent")
             _emit(result)
@@ -380,7 +399,7 @@ def main() -> None:
             project_data = load_project(args.project)
             result = validate_project_avatar(project_data, args.project)
             if not result:
-                raise ProjectError("El proyecto no tiene un avatar3d registrado. Usa `rigmctl avatar3d attach`.")
+                raise ProjectError("El proyecto no tiene un avatar3d registrado. Usa `meshingupctl avatar3d attach`.")
             _emit({"avatar": project_data.get("avatar3d"), "validation": result})
             if result["errors"]:
                 raise SystemExit(2)

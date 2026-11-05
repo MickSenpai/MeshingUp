@@ -9,7 +9,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue) -or -not (Get-Command 
     throw 'Node.js 20.19+ no está en PATH. Instala Node.js LTS y vuelve a ejecutar este script.'
 }
 $nodeVersion = [version]((node --version).TrimStart('v').Split('-')[0])
-if ($nodeVersion -lt [version]'20.19') { throw "Node.js $nodeVersion es antiguo; RigM requiere 20.19+ LTS." }
+if ($nodeVersion -lt [version]'20.19') { throw "Node.js $nodeVersion es antiguo; MeshingUp requiere 20.19+ LTS." }
 
 if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe')) {
     python -m venv .venv
@@ -21,7 +21,7 @@ New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip 'setuptools>=68' wheel
 if ($LASTEXITCODE -ne 0) { throw 'No pude instalar pip/setuptools en el entorno virtual.' }
 & .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e '.[rigging,avatar3d]'
-if ($LASTEXITCODE -ne 0) { throw 'No pude instalar RigM y sus dependencias 3D en el entorno virtual.' }
+if ($LASTEXITCODE -ne 0) { throw 'No pude instalar MeshingUp y sus dependencias 3D en el entorno virtual.' }
 
 Push-Location viewer3d
 try {
@@ -35,6 +35,6 @@ try {
 
 Write-Host ''
 Write-Host 'Instalación lista. Ejecuta:'
-Write-Host '  .\.venv\Scripts\rigm.exe'
-Write-Host '  .\.venv\Scripts\rigmctl.exe --help'
+Write-Host '  .\.venv\Scripts\meshingup.exe'
+Write-Host '  .\.venv\Scripts\meshingupctl.exe --help'
 Write-Host 'El auto-rig y los clips 3D del visor funcionan sin Blender.'
