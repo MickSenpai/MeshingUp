@@ -11,9 +11,9 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from .project import ProjectError, load_project, save_project
+from .project import ProjectError, load_project, save_project, update_workflow
 
 
 VRM_REQUIRED_HUMAN_BONES = (
@@ -63,7 +63,7 @@ def inspect_vrm(path: str | Path) -> dict[str, Any]:
     if not isinstance(vrm, dict):
         legacy = "VRM" in extensions or "VRM" in document.get("extensionsUsed", [])
         if legacy:
-            raise ProjectError("Este modelo usa VRM 0.x. RigM requiere VRM 1.0 para mantener una asignación humanoide y expresiones interoperables.")
+            raise ProjectError("Este modelo usa VRM 0.x. MeshingUp requiere VRM 1.0 para mantener una asignación humanoide y expresiones interoperables.")
         raise ProjectError("El GLB no contiene la extensión VRMC_vrm; importa un avatar VRM 1.0.")
     meta = vrm.get("meta", {})
     if not isinstance(meta, dict):
@@ -199,13 +199,13 @@ def validate_glb(path: str | Path) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     if not info["mesh_count"] or not info["primitive_count"]:
-        errors.append("El GLB no contiene mallas que RigM pueda mostrar o riggear.")
+        errors.append("El GLB no contiene mallas que MeshingUp pueda mostrar o riggear.")
     if info["invalid_skin_joints"]:
         errors.append("Una skin referencia nodos inexistentes o índices de hueso inválidos.")
     if info["empty_skins"]:
         errors.append("El GLB contiene skins sin huesos asignados.")
     if not info["rigged"]:
-        warnings.append("Este GLB aún no tiene esqueleto. Puedes previsualizarlo o pedir a RigM que proponga un auto-rig con Blender.")
+        warnings.append("Este GLB aún no tiene esqueleto. Puedes previsualizarlo o pedir a MeshingUp que proponga un auto-rig con Blender.")
     if info["rigged"] and not info["animations"]:
         warnings.append("El GLB tiene skin, pero no trae clips de animación.")
     return {"valid": not errors, "errors": errors, "warnings": warnings, **info}
@@ -296,7 +296,7 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
 
 
 def create_avatar_project(model_path: str | Path, project_path: str | Path, *, name: str | None = None, actor: str = "user") -> dict[str, Any]:
-    """Create a portable 3D-only RigM project from a GLB or VRM avatar."""
+    """Create a portable 3D-only MeshingUp project from a GLB or VRM avatar."""
     source = Path(model_path).expanduser().resolve()
     if source.suffix.casefold() == ".vrm":
         validation = validate_vrm(source)
@@ -378,7 +378,7 @@ def autorig_glb(project_path: str | Path, *, blender_path: str | None = None, fo
     if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected_source_hash:
         raise ProjectError("El GLB original falta o cambió desde que se importó; vuelve a importarlo antes de riggear.")
     script = Path(__file__).with_name("blender_autorig.py")
-    with tempfile.TemporaryDirectory(prefix=".rigm-autorig-", dir=project_file.parent) as temporary_dir:
+    with tempfile.TemporaryDirectory(prefix=".meshingup-autorig-", dir=project_file.parent) as temporary_dir:
         output = Path(temporary_dir) / "rigged.glb"
         report_file = Path(temporary_dir) / "analysis.json"
         command = [*launcher]
@@ -410,6 +410,7 @@ def autorig_glb(project_path: str | Path, *, blender_path: str | None = None, fo
             "name": avatar.get("name", source.stem),
             "source_path": source_path, "source_sha256": source_hash,
             "rigging": {"method": "blender_geometry_autorig", "forward_axis": forward_axis, **report},
+            **_repair_lineage(avatar),
         })
     return {**attached, "analysis": report}
 
@@ -446,7 +447,7 @@ def analyze_avatar_parts(
     if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
         raise ProjectError("El GLB fuente falta o cambió; vuelve a importarlo antes de analizar sus piezas.")
     script = Path(__file__).with_name("blender_analyze_parts.py")
-    with tempfile.TemporaryDirectory(prefix=".rigm-parts-analysis-", dir=project_file.parent) as temporary_dir:
+    with tempfile.TemporaryDirectory(prefix=".meshingup-parts-analysis-", dir=project_file.parent) as temporary_dir:
         report_file = Path(temporary_dir) / "parts.json"
         command = [*launcher]
         if launcher[0] == flatpak:
@@ -496,7 +497,7 @@ def animate_avatar3d(
     """Create an editable GLB action from structured semantic rig-axis rotations."""
     launcher = resolve_blender_launcher(blender_path)
     if not launcher:
-        raise ProjectError("No encuentro Blender. Instálalo para generar animaciones GLB con `rigmctl avatar3d animate`.")
+        raise ProjectError("No encuentro Blender. Instálalo para generar animaciones GLB con `meshingupctl avatar3d animate`.")
     clip_name = str(name).strip()
     if not clip_name or len(clip_name) > 80:
         raise ProjectError("El nombre de la animación debe tener entre 1 y 80 caracteres.")
@@ -551,7 +552,7 @@ def animate_avatar3d(
     if clip_name in inspect_glb(source)["animations"]:
         raise ProjectError(f"Ya existe una animación llamada `{clip_name}`. Elige otro nombre para conservar la anterior.")
     script = Path(__file__).with_name("blender_animate.py")
-    with tempfile.TemporaryDirectory(prefix=".rigm-animation-", dir=project_file.parent) as temporary_dir:
+    with tempfile.TemporaryDirectory(prefix=".meshingup-animation-", dir=project_file.parent) as temporary_dir:
         temporary = Path(temporary_dir)
         output, report_path, request_path = temporary / "animated.glb", temporary / "animation.json", temporary / "request.json"
         request_path.write_text(json.dumps({"name": clip_name, "duration": duration, "fps": fps, "keyframes": normalized_keys}), encoding="utf-8")
@@ -583,8 +584,242 @@ def animate_avatar3d(
             "source_path": info.get("source_path", ""),
             "source_sha256": info.get("source_sha256", ""),
             "rigging": rigging,
+            **_repair_lineage(info),
         })
     return {**attached, "animation": report}
+
+
+def _repair_lineage(avatar: dict[str, Any]) -> dict[str, Any]:
+    """Metadata that must survive every re-attach so the untouched original stays traceable."""
+    return {key: avatar[key] for key in ("repair", "original_path", "original_sha256") if avatar.get(key)}
+
+
+def _blender_command(launcher: list[str], script: Path, project_dir: Path, arguments: list[str]) -> list[str]:
+    command = [*launcher]
+    flatpak = shutil.which("flatpak")
+    if flatpak and launcher[0] == flatpak:
+        command[3:3] = [f"--filesystem={project_dir}", f"--filesystem={script.parent}"]
+    command.extend(["--background", "--factory-startup", "--python-exit-code", "1", "--python", str(script), "--", *arguments])
+    return command
+
+
+def _project_relative_file(project_file: Path, relative: str, what: str) -> Path:
+    path = Path(str(relative))
+    if path.is_absolute() or ".." in path.parts or not path.parts:
+        raise ProjectError(f"La ruta de {what} debe ser relativa y permanecer dentro del proyecto.")
+    resolved = (project_file.parent / path).resolve()
+    try:
+        resolved.relative_to(project_file.parent.resolve())
+    except ValueError as exc:
+        raise ProjectError(f"La ruta de {what} sale de la carpeta del proyecto.") from exc
+    return resolved
+
+
+def repair_avatar_mesh(
+    project_path: str | Path,
+    *,
+    blender_path: str | None = None,
+    min_island_vertices: int = 0,
+    actor: str = "agent",
+    expected_mtime_ns: int | None = None,
+    rebuild_rigged: bool = False,
+) -> dict[str, Any]:
+    """Weld seam duplicates and drop dead geometry from the project's GLB using Blender.
+
+    The original GLB is never modified: the repaired mesh is attached as a new
+    file and the original stays in the project (``original_path``/``original_sha256``),
+    so the rig can always be rebuilt from it. Islands are only deleted when
+    ``min_island_vertices`` asks for it; otherwise they are just reported.
+    A rigged avatar is only replaced when ``rebuild_rigged`` is set, because the
+    repaired mesh has no skin.
+    """
+    if not isinstance(min_island_vertices, int) or not 0 <= min_island_vertices <= 100000:
+        raise ProjectError("min_island_vertices debe ser un entero entre 0 y 100000.")
+    launcher = resolve_blender_launcher(blender_path)
+    if not launcher:
+        raise ProjectError("No encuentro Blender. Instala Blender y vuelve a intentarlo, o indica su ejecutable con --blender.")
+    project_file = Path(project_path).expanduser().resolve()
+    starting_mtime_ns = project_file.stat().st_mtime_ns
+    if expected_mtime_ns is not None and starting_mtime_ns != expected_mtime_ns:
+        raise ProjectError("El proyecto cambió desde que se abrió; recárgalo antes de reparar la malla.")
+    data = load_project(project_file)
+    avatar = data.get("avatar3d", {})
+    if not isinstance(avatar, dict) or avatar.get("format") != "glb":
+        raise ProjectError("Primero importa un archivo GLB al proyecto.")
+    if avatar.get("rigged") and not rebuild_rigged:
+        raise ProjectError("El avatar ya tiene rig y la reparación crearía un modelo sin esqueleto. Usa «Preparar avatar completo» para repararlo y volver a riggear.")
+    if avatar.get("original_path"):
+        input_relative, expected_hash = avatar["original_path"], avatar.get("original_sha256")
+    elif avatar.get("rigged"):
+        if not avatar.get("source_path"):
+            raise ProjectError("Este rig no conserva el GLB original, así que no puedo repararlo y rehacerlo.")
+        input_relative, expected_hash = avatar["source_path"], avatar.get("source_sha256")
+    else:
+        input_relative, expected_hash = avatar.get("path", ""), avatar.get("sha256")
+    source = _project_relative_file(project_file, input_relative, "el GLB original")
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected_hash:
+        raise ProjectError("El GLB original falta o cambió desde que se importó; vuelve a importarlo antes de repararlo.")
+    script = Path(__file__).with_name("blender_repair.py")
+    with tempfile.TemporaryDirectory(prefix=".meshingup-repair-", dir=project_file.parent) as temporary_dir:
+        output, report_file = Path(temporary_dir) / "repaired.glb", Path(temporary_dir) / "repair.json"
+        command = _blender_command(launcher, script, project_file.parent, [str(source), str(output), str(report_file), str(min_island_vertices)])
+        try:
+            process = subprocess.run(command, capture_output=True, text=True, timeout=900, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProjectError(f"No pude ejecutar la reparación de Blender: {exc}") from exc
+        if process.returncode != 0 or not output.is_file() or not report_file.is_file():
+            detail = (process.stderr or process.stdout or "Blender terminó sin generar el GLB reparado.")[-3500:]
+            raise ProjectError("Falló la reparación en Blender. El archivo original sigue intacto. Detalle: " + detail)
+        try:
+            report = json.loads(report_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectError(f"Blender generó el modelo, pero no pude leer su informe: {exc}") from exc
+        result = validate_glb(output)
+        if result["errors"] or result["rigged"]:
+            raise ProjectError("El GLB reparado no es válido: " + " ".join(result["errors"] or ["tiene un esqueleto inesperado."]))
+        if project_file.stat().st_mtime_ns != starting_mtime_ns:
+            raise ProjectError("El proyecto cambió mientras Blender trabajaba. No guardé la reparación; recárgalo e inténtalo de nuevo.")
+        attached = attach_avatar(project_file, output, actor=actor, action="avatar3d_mesh_repaired", extra_metadata={
+            "name": avatar.get("name", source.stem),
+            "original_path": Path(str(input_relative)).as_posix(), "original_sha256": expected_hash,
+            "repair": report,
+        })
+    return {**attached, "repair": report}
+
+
+ANIMATION_PRESETS: dict[str, dict[str, Any]] = {
+    # Rotations are normalized armature XYZ degrees (X side, Y front-back, Z up),
+    # applied as Rz·Ry·Rx. In the T-pose a rotation about Y lowers the left arm
+    # (+) / right arm (-); about Z (right arm, +) swings it forward; with the
+    # arm forward, -X on the forearm bends it up. Arms rest 60° below the
+    # T-pose. Loops end on their first pose.
+    "idle": {
+        "duration": 90, "fps": 30,
+        "keyframes": [
+            *({"frame": f, "bone": "leftUpperArm", "rotation": [0, 60, 0]} for f in (0, 90)),
+            *({"frame": f, "bone": "rightUpperArm", "rotation": [0, -60, 0]} for f in (0, 90)),
+            {"frame": 0, "bone": "chest", "rotation": [0, 0, 0]},
+            {"frame": 45, "bone": "chest", "rotation": [1.5, 0, 0]},
+            {"frame": 90, "bone": "chest", "rotation": [0, 0, 0]},
+            {"frame": 0, "bone": "head", "rotation": [0, 0, 0]},
+            {"frame": 30, "bone": "head", "rotation": [0, 0, 2]},
+            {"frame": 60, "bone": "head", "rotation": [0, 0, -2]},
+            {"frame": 90, "bone": "head", "rotation": [0, 0, 0]},
+        ],
+    },
+    "wave": {
+        "duration": 60, "fps": 30,
+        "keyframes": [
+            *({"frame": f, "bone": "leftUpperArm", "rotation": [0, 60, 0]} for f in (0, 60)),
+            {"frame": 0, "bone": "rightUpperArm", "rotation": [0, -60, 0]},
+            {"frame": 12, "bone": "rightUpperArm", "rotation": [0, -20, 70]},
+            {"frame": 48, "bone": "rightUpperArm", "rotation": [0, -20, 70]},
+            {"frame": 60, "bone": "rightUpperArm", "rotation": [0, -60, 0]},
+            {"frame": 0, "bone": "rightLowerArm", "rotation": [0, 0, 0]},
+            {"frame": 12, "bone": "rightLowerArm", "rotation": [-80, 0, 0]},
+            {"frame": 21, "bone": "rightLowerArm", "rotation": [-80, 25, 0]},
+            {"frame": 30, "bone": "rightLowerArm", "rotation": [-80, -25, 0]},
+            {"frame": 39, "bone": "rightLowerArm", "rotation": [-80, 25, 0]},
+            {"frame": 48, "bone": "rightLowerArm", "rotation": [-80, 0, 0]},
+            {"frame": 60, "bone": "rightLowerArm", "rotation": [0, 0, 0]},
+        ],
+    },
+}
+
+
+def auto_prepare_avatar(
+    project_path: str | Path,
+    *,
+    blender_path: str | None = None,
+    forward_axis: str = "-Y",
+    repair: bool = True,
+    min_island_vertices: int = 0,
+    clips: tuple[str, ...] | list[str] = ("idle", "wave"),
+    actor: str = "agent",
+    expected_mtime_ns: int | None = None,
+    progress: Callable[[int, str], None] | None = None,
+) -> dict[str, Any]:
+    """Repair the mesh, add bones and weights, then add base animation clips.
+
+    Progress and the last result are written to the project manifest after each
+    step so the library can follow the work. The outcome is always
+    ``needs_review``: the automatic checks never replace a visual review. If a
+    step fails after the repair replaced a rigged avatar, the previous avatar is
+    restored.
+    """
+    unknown = [name for name in clips if name not in ANIMATION_PRESETS]
+    if unknown:
+        raise ProjectError("Animaciones desconocidas: " + ", ".join(unknown) + ". Disponibles: " + ", ".join(ANIMATION_PRESETS) + ".")
+    project_file = Path(project_path).expanduser().resolve()
+    if expected_mtime_ns is not None and project_file.stat().st_mtime_ns != expected_mtime_ns:
+        raise ProjectError("El proyecto cambió desde que se abrió; recárgalo antes de preparar el avatar.")
+    data = load_project(project_file)
+    previous_avatar = json.loads(json.dumps(data.get("avatar3d", {})))
+    if previous_avatar.get("format") != "glb":
+        raise ProjectError("Primero importa un archivo GLB al proyecto.")
+    task_id = f"avatar3d-auto-{uuid.uuid4().hex[:8]}"
+    steps: list[dict[str, Any]] = []
+    total = (1 if repair else 0) + 1 + len(clips)
+    done = 0
+
+    def report(stage: str, detail: str) -> None:
+        percent = int(done / total * 100)
+        update_workflow(project_file, "in_progress", stage, detail, percent, task_id)
+        if progress:
+            progress(percent, detail)
+
+    try:
+        needs_repair = repair and not previous_avatar.get("repair")
+        if needs_repair:
+            report("avatar3d_repair", "Reparando la malla con Blender…")
+            repaired = repair_avatar_mesh(
+                project_file, blender_path=blender_path, min_island_vertices=min_island_vertices,
+                actor=actor, rebuild_rigged=bool(previous_avatar.get("rigged")),
+            )
+            steps.append({"step": "repair", "welded_vertices": sum(c["welded_vertices"] for c in repaired["repair"]["changes"].values()),
+                          "warnings": repaired["repair"]["warnings"]})
+            done += 1
+        elif repair:
+            steps.append({"step": "repair", "skipped": "ya reparado"})
+            done += 1
+        report("avatar3d_autorig", "Creando huesos y pesos con Blender…")
+        rigged = autorig_glb(project_file, blender_path=blender_path, forward_axis=forward_axis, actor=actor)
+        analysis = rigged["analysis"]
+        deformation = analysis.get("deformation_validation", {})
+        steps.append({"step": "autorig", "confidence": analysis.get("confidence"),
+                      "failed_poses": deformation.get("failed_pose_count"), "poses": deformation.get("pose_count")})
+        done += 1
+        existing = set(inspect_glb(project_file.parent / rigged["avatar"]["path"])["animations"])
+        for name in clips:
+            clip_name = f"MeshingUp · {name.capitalize()}"
+            if clip_name in existing:
+                steps.append({"step": f"clip:{name}", "skipped": "ya existe"})
+            else:
+                report("avatar3d_animation", f"Generando la animación «{clip_name}»…")
+                preset = ANIMATION_PRESETS[name]
+                animate_avatar3d(project_file, clip_name, preset["duration"], preset["fps"], preset["keyframes"], blender_path=blender_path, actor=actor)
+                steps.append({"step": f"clip:{name}", "name": clip_name})
+            done += 1
+    except Exception as exc:
+        restored = False
+        current = load_project(project_file)
+        if previous_avatar.get("rigged") and not current.get("avatar3d", {}).get("rigged"):
+            current["avatar3d"] = previous_avatar
+            save_project(project_file, current, action="avatar3d_auto_rolled_back", actor=actor)
+            restored = True
+        update_workflow(project_file, "failed", "avatar3d_auto", str(exc)[:500] + (" Se restauró el rig anterior." if restored else ""), int(done / total * 100), task_id)
+        raise
+    failed = next((item.get("failed_poses") for item in steps if item["step"] == "autorig"), None)
+    summary = (
+        f"Avatar preparado: {len(steps)} pasos. "
+        + (f"La prueba de deformación falló en {failed} poses; " if failed else "")
+        + "revisa el rig visualmente antes de usarlo."
+    )
+    update_workflow(project_file, "needs_review", "avatar3d_review", summary, 100, task_id)
+    if progress:
+        progress(100, "Listo")
+    return {"project": str(project_file), "task_id": task_id, "steps": steps, "summary": summary,
+            "avatar": load_project(project_file)["avatar3d"]}
 
 
 def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> dict[str, Any] | None:

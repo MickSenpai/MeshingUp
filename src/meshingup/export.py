@@ -1,4 +1,4 @@
-"""Portable RigM runtime bundle exporter."""
+"""Portable MeshingUp runtime bundle exporter."""
 
 from __future__ import annotations
 
@@ -52,12 +52,12 @@ def export_bundle(project: str | Path, output: str | Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            archive.writestr("project.rigm", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            archive.writestr("project.meshingup", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             for archive_name, source in assets:
                 archive.write(source, archive_name)
             archive.writestr(
                 "README.txt",
-                "RigM portable runtime bundle. Open project.rigm with a compatible RigM runtime.\n",
+                "MeshingUp portable runtime bundle. Open project.meshingup with a compatible MeshingUp runtime.\n",
             )
     except OSError as exc:
         raise ProjectError(f"No pude crear el paquete de exportación: {exc}") from exc

@@ -7,13 +7,17 @@ from mathutils import Vector
 
 
 def fail(message):
-    print("RIGM_PART_ANALYSIS_ERROR: " + message, file=sys.stderr)
+    print("MESHINGUP_PART_ANALYSIS_ERROR: " + message, file=sys.stderr)
     raise RuntimeError(message)
 
 
 args = sys.argv[sys.argv.index("--") + 1:]
 source_path, report_path, forward_axis = args
 
+# Start from an empty scene: --factory-startup adds a default Cube/Light/Camera
+# that would otherwise be analysed or exported as if it belonged to the model.
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete(use_global=False)
 try:
     bpy.ops.import_scene.gltf(filepath=source_path)
 except Exception as exc:
@@ -192,4 +196,4 @@ report = {
 }
 with open(report_path, "w", encoding="utf-8") as output:
     json.dump(report, output, ensure_ascii=False, indent=2)
-print("RIGM_PART_ANALYSIS_COMPLETE: " + json.dumps({key: value for key, value in report.items() if key != "components"}, ensure_ascii=False))
+print("MESHINGUP_PART_ANALYSIS_COMPLETE: " + json.dumps({key: value for key, value in report.items() if key != "components"}, ensure_ascii=False))

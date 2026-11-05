@@ -5,6 +5,7 @@ import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
 import './style.css';
 import { preserveBindTransforms } from './hand_rig.js';
+import { createEditHistory } from './edit_history.js';
 
 const canvas = document.querySelector('#avatar');
 const nameLabel = document.querySelector('#model-name');
@@ -141,7 +142,7 @@ function requestHandSegmentation(event) {
       if (!accepted) handSegmentationPending = false;
       showStatus(avatarDisplayName, accepted
         ? `SAM 2 analiza la región del hueso ${handSegmentationCapture.targetBone} localmente…`
-        : 'RigM no pudo iniciar SAM 2. Instala la opción segmentation y vuelve a intentarlo.');
+        : 'MeshingUp no pudo iniciar SAM 2. Instala la opción segmentation y vuelve a intentarlo.');
     });
   } catch (error) { handSegmentationPending = false; showStatus(avatarDisplayName, `No pude capturar la vista: ${error.message}`); }
   event.preventDefault();
@@ -344,7 +345,7 @@ function applyHandSegmentationProposal() {
     mapped_vertices: changed, cleaned_outside_vertices: cleaned, mask_score: acceptedProposal.score || 0,
     confidence: 'user_review', note: 'Amarillo asigna la región aceptada; cian retira influencia sobrante visible fuera de la máscara y de la región geométrica más cercana al hueso. Requiere revisión.'
   };
-  if (action.size) { action.handMappingReport = mappingReport; handWeightUndo.push(action); }
+  if (action.size) { action.handMappingReport = mappingReport; editHistory.record('weights', action); }
   buildHandWeightDiagnostic(); handWeightsVisible = true; if (handWeightDiagnostic) handWeightDiagnostic.visible = true;
   discardHandSegmentationProposal();
   const message = `Propuesta aplicada a ${changed} vértices de ${boneName}; se retiró influencia sobrante en ${cleaned}. Revisa y usa Deshacer pesos si hace falta.`;
@@ -485,11 +486,11 @@ function moveBonePivotToWorld(bone, targetWorld, { method = 'manual_pivot_edit',
   action.pivotEdit = pivotEdit;
   action.kind = coalesce ? 'bone_position_control' : 'bone_pivot';
   action.boneName = bone.name;
-  const last = handBoneUndo[handBoneUndo.length - 1];
+  const last = editHistory.peek('bones');
   if (coalesce && last?.kind === action.kind && last.boneName === bone.name) {
     last.pivotEdit.end_world = [...pivotEdit.end_world];
   } else {
-    handBoneUndo.push(action);
+    editHistory.record('bones', action);
     bonePivotEdits.push(pivotEdit);
   }
   return { moved: true, action, message: `Se movió ${bone.name} y se mantuvieron ancladas sus articulaciones descendientes.` };
@@ -587,7 +588,7 @@ function finishBonePivotDrag() {
   drag.pivotEdit = pivotEdit;
   drag.kind = 'bone_pivot';
   drag.boneName = drag.bone.name;
-  handBoneUndo.push(drag);
+  editHistory.record('bones', drag);
   bonePivotEdits.push(pivotEdit);
   showStatus(avatarDisplayName, `Pivote ${drag.bone.name} movido sin desplazar sus articulaciones hijas. La pose neutral se conservó; puedes deshacer o guardar.`);
   return true;
@@ -603,7 +604,7 @@ renderer.domElement.addEventListener('pointerdown', (event) => {
 renderer.domElement.addEventListener('pointermove', (event) => { if (activeBonePivotDrag) updateBonePivotDrag(event); else if (handPaintPointerDown) paintHandWeights(event); });
 window.addEventListener('pointerup', () => {
   finishBonePivotDrag();
-  if (handPaintPointerDown) { if ([...handPaintStroke.values()].some((undo) => undo.size)) handWeightUndo.push(handPaintStroke); handPaintPointerDown = false; handPaintStroke = null; controls.enabled = true; }
+  if (handPaintPointerDown) { if ([...handPaintStroke.values()].some((undo) => undo.size)) editHistory.record('weights', handPaintStroke); handPaintPointerDown = false; handPaintStroke = null; controls.enabled = true; }
 });
 window.addEventListener('pointercancel', () => {
   finishBonePivotDrag();
@@ -631,8 +632,10 @@ let handWeightPaint = { enabled: false, boneName: '', radiusRatio: 0.012, streng
 const handPaintSelection = new Map();
 let handPaintSelectionGroup = null;
 let handPaintSelectionSources = [];
-let handWeightUndo = [];
-let handBoneUndo = [];
+// One Undo/Redo across weight edits and bone-pivot edits; see edit_history.js.
+const editHistory = createEditHistory({
+  onChange: ({ canUndo, canRedo }) => { callHost('historyChanged', canUndo, canRedo).catch(() => {}); },
+});
 let handPaintPointerDown = false;
 let handPaintStroke = null;
 let selectedBoneName = '';
@@ -667,14 +670,14 @@ const VISEMES = { silence: {}, closed: {}, open: { aa: 0.8 }, wide: { ih: 0.85 }
 
 function connectHost() {
   if (!window.qt?.webChannelTransport || !window.QWebChannel) return;
-  new QWebChannel(window.qt.webChannelTransport, (channel) => { hostBridge = channel.objects.rigmHost || null; });
+  new QWebChannel(window.qt.webChannelTransport, (channel) => { hostBridge = channel.objects.meshingupHost || null; });
 }
 connectHost();
 
 function callHost(method, ...args) {
   return new Promise((resolve, reject) => {
-    if (!hostBridge || typeof hostBridge[method] !== 'function') return reject(new Error('Canal de RigM no disponible.'));
-    const timeout = setTimeout(() => reject(new Error(`RigM no respondió a ${method}.`)), 60000);
+    if (!hostBridge || typeof hostBridge[method] !== 'function') return reject(new Error('Canal de MeshingUp no disponible.'));
+    const timeout = setTimeout(() => reject(new Error(`MeshingUp no respondió a ${method}.`)), 60000);
     try {
       hostBridge[method](...args, (result) => { clearTimeout(timeout); resolve(result); });
     } catch (error) { clearTimeout(timeout); reject(error); }
@@ -686,7 +689,7 @@ async function transferGlb(report) {
   const blob = await new GLTFExporter().parseAsync(avatarRoot, { binary: true, animations: gltfAnimations });
   const bytes = new Uint8Array(blob);
   const transferId = await callHost('beginAutoRig', avatarDisplayName, bytes.byteLength, JSON.stringify(report));
-  if (!transferId) throw new Error('RigM rechazó el archivo generado.');
+  if (!transferId) throw new Error('MeshingUp rechazó el archivo generado.');
   const chunkSize = 48 * 1024;
   try {
     for (let offset = 0; offset < bytes.length; offset += chunkSize) {
@@ -700,7 +703,7 @@ async function transferGlb(report) {
       }
     }
     const saved = await callHost('finishAutoRig', transferId);
-    if (!saved) throw new Error('RigM no pudo guardar el GLB generado.');
+    if (!saved) throw new Error('MeshingUp no pudo guardar el GLB generado.');
   } catch (error) {
     hostBridge.cancelAutoRig(transferId);
     throw error;
@@ -773,7 +776,7 @@ function refreshBoneData() {
     manualBoneRotations.clear();
     manualBonePositions.clear();
     bonePivotCompensations.clear();
-    handBoneUndo = [];
+    editHistory.clear();
     bonePivotEdits.length = 0;
     for (const node of detectedBones) {
       boneRestQuaternions.set(node, node.quaternion.clone());
@@ -806,7 +809,7 @@ function refreshBoneData() {
       new THREE.SphereGeometry(markerSize, 6, 4),
       new THREE.MeshBasicMaterial({ color: markerColor, depthTest: false, depthWrite: false }),
     );
-    marker.name = `RigM joint diagnostic · ${bone.name}`;
+    marker.name = `MeshingUp joint diagnostic · ${bone.name}`;
     marker.userData.bone = bone;
     marker.renderOrder = 12;
     handDiagnosticGroup.add(marker);
@@ -959,7 +962,7 @@ function rebuildHandPaintSelectionOverlay() {
   }
   handPaintSelectionSources = [];
   handPaintSelectionGroup = new THREE.Group();
-  handPaintSelectionGroup.name = 'RigM · pincel · vértices tocados';
+  handPaintSelectionGroup.name = 'MeshingUp · pincel · vértices tocados';
   const height = Math.max(new THREE.Box3().setFromObject(avatarRoot).getSize(new THREE.Vector3()).y, 1e-4);
   for (const [mesh, selected] of handPaintSelection) {
     if (!selected.size) continue;
@@ -1026,25 +1029,51 @@ function configureHandWeightPaint(enabled, boneName = selectedBoneName, options 
   return { ...handWeightPaint };
 }
 
-function undoHandWeightPaint() {
-  const action = handWeightUndo.pop();
-  if (!action) return false;
+// Swap the stored vertex weights with the current ones and return the snapshot
+// that reverses the swap, so the same routine serves both undo and redo.
+function swapWeightSnapshot(action) {
+  const inverse = new Map();
   for (const [mesh, undo] of action) {
     const indices = mesh.geometry.attributes.skinIndex, weights = mesh.geometry.attributes.skinWeight;
-    for (const [vertex, old] of undo) for (let slot = 0; slot < 4; slot++) {
-      indices.setComponent(vertex, slot, old.indices[slot]); weights.setComponent(vertex, slot, old.weights[slot]);
+    const current = new Map();
+    for (const [vertex, old] of undo) {
+      current.set(vertex, {
+        indices: [0, 1, 2, 3].map((slot) => indices.getComponent(vertex, slot)),
+        weights: [0, 1, 2, 3].map((slot) => weights.getComponent(vertex, slot)),
+      });
+      for (let slot = 0; slot < 4; slot++) {
+        indices.setComponent(vertex, slot, old.indices[slot]); weights.setComponent(vertex, slot, old.weights[slot]);
+      }
     }
     indices.needsUpdate = true; weights.needsUpdate = true;
+    inverse.set(mesh, current);
   }
-  clearHandPaintSelection();
-  if (action.handMappingReport) {
-    const index = handMappingReports.indexOf(action.handMappingReport);
-    if (index >= 0) handMappingReports.splice(index, 1);
-  }
-  buildHandWeightDiagnostic();
-  showStatus(avatarDisplayName, 'Se deshizo la última pasada del pincel.');
-  return true;
+  inverse.handMappingReport = action.handMappingReport;
+  return inverse;
 }
+
+const weightHistoryHandler = {
+  undo(action) {
+    const inverse = swapWeightSnapshot(action);
+    clearHandPaintSelection();
+    if (action.handMappingReport) {
+      const index = handMappingReports.indexOf(action.handMappingReport);
+      if (index >= 0) handMappingReports.splice(index, 1);
+    }
+    buildHandWeightDiagnostic();
+    showStatus(avatarDisplayName, 'Se deshizo la última edición de pesos.');
+    return inverse;
+  },
+  redo(action) {
+    const inverse = swapWeightSnapshot(action);
+    clearHandPaintSelection();
+    if (action.handMappingReport && !handMappingReports.includes(action.handMappingReport)) handMappingReports.push(action.handMappingReport);
+    buildHandWeightDiagnostic();
+    showStatus(avatarDisplayName, 'Se rehizo la edición de pesos.');
+    return inverse;
+  },
+};
+editHistory.register('weights', weightHistoryHandler);
 
 function assignHandPaintSelectionToBone() {
   const boneName = handWeightPaint.boneName || selectedBoneName;
@@ -1155,7 +1184,7 @@ function assignHandPaintSelectionToBone() {
       }
     }
   }
-  if (action.size) handWeightUndo.push(action);
+  if (action.size) editHistory.record('weights', action);
   buildHandWeightDiagnostic(boneName);
   handWeightsVisible = true;
   if (handWeightDiagnostic) handWeightDiagnostic.visible = true;
@@ -1224,7 +1253,7 @@ function autoCorrectFingerWeights(side) {
     }
     if (undo.size) { indexAttr.needsUpdate = true; weightAttr.needsUpdate = true; action.set(mesh, undo); }
   });
-  if (action.size) { handWeightUndo.push(action); buildHandWeightDiagnostic(); }
+  if (action.size) { editHistory.record('weights', action); buildHandWeightDiagnostic(); }
   if (changed) handWeightsVisible = true;
   if (handWeightDiagnostic) handWeightDiagnostic.visible = handWeightsVisible;
   const message = changed
@@ -1307,7 +1336,7 @@ function fitFingerSkeletonToWeights(side) {
     avatarRoot.updateMatrixWorld(true);
     for (const skeleton of skeletons) preserveBindTransforms(skeleton, oldWorlds.get(skeleton), oldInverses.get(skeleton));
     for (const [bone] of oldPositions) boneRestPositions.set(bone, bone.position.clone());
-    handBoneUndo.push({ positions: oldPositions, restPositions: oldRestPositions, inverses: oldInverses });
+    editHistory.record('bones', { positions: oldPositions, restPositions: oldRestPositions, inverses: oldInverses });
   }
   const message = moved
     ? `Ajuste provisional · ${moved} articulaciones en ${fitted} dedos, según sus vértices ponderados. Revisa la silueta y deshaz si se deforma.`
@@ -1316,28 +1345,56 @@ function fitFingerSkeletonToWeights(side) {
   return { moved, fitted_digits: fitted, sample_count: sampleCount, message };
 }
 
-function undoFingerSkeletonFit() {
-  const action = handBoneUndo.pop();
-  if (!action) return false;
+// Swap bone positions, bind inverses and manual offsets with their stored
+// values and return the snapshot that reverses the swap (undo and redo share it).
+function swapBoneSnapshot(action) {
+  const inverse = {
+    kind: action.kind, boneName: action.boneName, pivotEdit: action.pivotEdit,
+    positions: new Map(), restPositions: new Map(), inverses: new Map(),
+    positionOffsets: new Map(), pivotCompensations: new Map(),
+  };
   for (const [bone, position] of action.positions) {
+    inverse.positions.set(bone, bone.position.clone());
+    inverse.restPositions.set(bone, boneRestPositions.get(bone)?.clone() || bone.position.clone());
     bone.position.copy(position);
     boneRestPositions.set(bone, action.restPositions.get(bone));
+  }
+  for (const name of action.positionOffsets?.keys() || []) {
+    inverse.positionOffsets.set(name, manualBonePositions.has(name) ? [...manualBonePositions.get(name)] : null);
+  }
+  for (const name of action.pivotCompensations?.keys() || []) {
+    inverse.pivotCompensations.set(name, bonePivotCompensations.has(name) ? [...bonePivotCompensations.get(name)] : null);
   }
   restoreNamedMap(manualBonePositions, action.positionOffsets);
   restoreNamedMap(bonePivotCompensations, action.pivotCompensations);
   avatarRoot?.updateMatrixWorld(true);
   for (const [skeleton, inverses] of action.inverses) {
+    inverse.inverses.set(skeleton, skeleton.boneInverses.map((matrix) => matrix.clone()));
     skeleton.boneInverses = inverses.map((matrix) => matrix.clone());
     skeleton.update();
   }
-  if (action.pivotEdit) {
-    const index = bonePivotEdits.lastIndexOf(action.pivotEdit);
-    if (index >= 0) bonePivotEdits.splice(index, 1);
-  }
   avatarRoot?.updateMatrixWorld(true);
-  showStatus(avatarDisplayName, 'Se deshizo el último ajuste provisional de pivote/huesos.');
-  return true;
+  return inverse;
 }
+
+const boneHistoryHandler = {
+  undo(action) {
+    const inverse = swapBoneSnapshot(action);
+    if (action.pivotEdit) {
+      const index = bonePivotEdits.lastIndexOf(action.pivotEdit);
+      if (index >= 0) bonePivotEdits.splice(index, 1);
+    }
+    showStatus(avatarDisplayName, 'Se deshizo el último ajuste de pivote/huesos.');
+    return inverse;
+  },
+  redo(action) {
+    const inverse = swapBoneSnapshot(action);
+    if (action.pivotEdit && !bonePivotEdits.includes(action.pivotEdit)) bonePivotEdits.push(action.pivotEdit);
+    showStatus(avatarDisplayName, 'Se rehizo el ajuste de pivote/huesos.');
+    return inverse;
+  },
+};
+editHistory.register('bones', boneHistoryHandler);
 
 function autoCorrectSelectedBoneWeights(boneName = selectedBoneName) {
   const bone = findBone(boneName);
@@ -1413,7 +1470,7 @@ function autoCorrectSelectedBoneWeights(boneName = selectedBoneName) {
     }
     if (undo.size) { indices.needsUpdate = true; weights.needsUpdate = true; action.set(mesh, undo); }
   });
-  if (action.size) { handWeightUndo.push(action); buildHandWeightDiagnostic(boneName); handWeightsVisible = true; handWeightDiagnostic.visible = true; }
+  if (action.size) { editHistory.record('weights', action); buildHandWeightDiagnostic(boneName); handWeightsVisible = true; handWeightDiagnostic.visible = true; }
   const message = changed || cleaned
     ? `Propuesta para ${boneName}: ${changed} vértices reforzados cerca del segmento y ${cleaned} influencias lejanas retiradas. Revisa el mapa y deshaz si hace falta.`
     : `No se encontraron pesos corregibles para ${boneName} (${examined} vértices locales revisados).`;
@@ -1475,7 +1532,7 @@ function centerSelectedBonePivotOnWeights(boneName = selectedBoneName) {
     new THREE.SphereGeometry(markerSize, 12, 8),
     new THREE.MeshBasicMaterial({ color: 0x35e0d0, depthTest: false, transparent: true, opacity: 0.98 }),
   );
-  bonePivotProposalMarker.name = `RigM proposed pivot · ${boneName}`;
+  bonePivotProposalMarker.name = `MeshingUp proposed pivot · ${boneName}`;
   bonePivotProposalMarker.position.copy(target);
   bonePivotProposalMarker.renderOrder = 20;
   scene.add(bonePivotProposalMarker);
@@ -1537,7 +1594,7 @@ function playSelectedBoneTest(boneName = selectedBoneName) {
     const q = rest.clone().multiply(delta); values.push(q.x,q.y,q.z,q.w);
   }
   manualPoseMode = true;
-  const clip = new THREE.AnimationClip(`RigM Bone Test ${boneName}`,3.6,[new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`,times,values)]);
+  const clip = new THREE.AnimationClip(`MeshingUp Bone Test ${boneName}`,3.6,[new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`,times,values)]);
   const action = mixer.clipAction(clip); action.reset(); action.setLoop(THREE.LoopOnce,1); action.clampWhenFinished=false; action.play(); activeAction=action;
   action.getMixer().addEventListener('finished',event=>{ if(event.action===action){action.stop();restoreRestPose();activeAction=null;manualPoseMode=true;} });
   showStatus(avatarDisplayName,`Prueba de movimiento del hueso ${boneName} · tres ejes · vuelve a reposo al terminar`);
@@ -1636,7 +1693,7 @@ function playHandTest(side) {
   }
   if (!tracks.length) return {ok:false,message:'No hay falanges para generar la prueba.'};
   manualPoseMode = true;
-  const clip = new THREE.AnimationClip(`RigM Hand Test ${side}`, 2, tracks);
+  const clip = new THREE.AnimationClip(`MeshingUp Hand Test ${side}`, 2, tracks);
   const action = mixer.clipAction(clip); action.reset(); action.setLoop(THREE.LoopOnce,1); action.clampWhenFinished = false; action.play(); activeAction = action;
   action.getMixer().addEventListener('finished', (event) => { if (event.action === action) { action.stop(); restoreRestPose(); activeAction = null; manualPoseMode = true; } });
   showStatus(avatarDisplayName, `Prueba de falanges · ${side} · vuelve a reposo al terminar`);
@@ -1657,7 +1714,7 @@ function playWristTest(side) {
     const q = rest.clone().multiply(delta); values.push(q.x,q.y,q.z,q.w);
   }
   manualPoseMode = true;
-  const clip = new THREE.AnimationClip(`RigM Wrist Test ${side}`, 3.6, [new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`,times,values)]);
+  const clip = new THREE.AnimationClip(`MeshingUp Wrist Test ${side}`, 3.6, [new THREE.QuaternionKeyframeTrack(`${bone.name}.quaternion`,times,values)]);
   const action = mixer.clipAction(clip); action.reset(); action.setLoop(THREE.LoopOnce,1); action.clampWhenFinished=false; action.play(); activeAction=action;
   action.getMixer().addEventListener('finished', event => { if (event.action===action) { action.stop(); restoreRestPose(); activeAction=null; manualPoseMode=true; } });
   showStatus(avatarDisplayName,`Prueba de muñeca ${side} · flexión, extensión e inclinación local`);
@@ -1694,7 +1751,7 @@ function resetAllBones() {
     skeleton.boneInverses = inverses.map((matrix) => matrix.clone());
     skeleton.update();
   }
-  handBoneUndo = [];
+  editHistory.clear('bones');
   bonePivotEdits.length = 0;
   avatarRoot?.updateMatrixWorld(true);
 }
@@ -1744,13 +1801,13 @@ function addBoneRotation(name, x = 0, y = 0, z = 0) {
 
 let gltfAnimations = [];
 const GENERATED_ACTIONS = [
-  { action: 'idle', name: 'RigM · Idle', duration: 3.2 },
-  { action: 'listen', name: 'RigM · Listening', duration: 2.8 },
-  { action: 'think', name: 'RigM · Thinking', duration: 3.6 },
-  { action: 'talk', name: 'RigM · Speaking', duration: 2.4 },
-  { action: 'wait', name: 'RigM · Waiting', duration: 3.4 },
-  { action: 'pace', name: 'RigM · Walk cycle', duration: 1.2 },
-  { action: 'recover', name: 'RigM · Recover', duration: 2.6 },
+  { action: 'idle', name: 'MeshingUp · Idle', duration: 3.2 },
+  { action: 'listen', name: 'MeshingUp · Listening', duration: 2.8 },
+  { action: 'think', name: 'MeshingUp · Thinking', duration: 3.6 },
+  { action: 'talk', name: 'MeshingUp · Speaking', duration: 2.4 },
+  { action: 'wait', name: 'MeshingUp · Waiting', duration: 3.4 },
+  { action: 'pace', name: 'MeshingUp · Walk cycle', duration: 1.2 },
+  { action: 'recover', name: 'MeshingUp · Recover', duration: 2.6 },
 ];
 
 function generatedBone(name) {
@@ -2409,7 +2466,7 @@ async function createGeometricRig(forwardAxis = '+Z') {
 }
 
 async function autoRig(forwardAxis = '+Z') {
-  if (!hostBridge) throw new Error('El canal local de RigM no está disponible.');
+  if (!hostBridge) throw new Error('El canal local de MeshingUp no está disponible.');
   if (operationBusy) throw new Error('Ya hay una operación 3D en curso.');
   operationBusy = true;
   try {
@@ -2427,17 +2484,17 @@ async function saveEditedModel() {
   if (operationBusy) throw new Error('Ya hay una operación 3D en curso.');
   operationBusy = true;
   try {
-  const report = { method: 'rigm_threejs_pose_edit', bones: autoRigBones.length, confidence: 'user_review',
+  const report = { method: 'meshingup_threejs_pose_edit', bones: autoRigBones.length, confidence: 'user_review',
     region_weight_mappings: handMappingReports,
     bone_pivot_edits: bonePivotEdits,
-    warnings: ['GLB actualizado desde la pose editada en RigM; revisa la deformación antes de producción.', ...(handMappingReports.length ? ['Los pesos incluyen propuestas SAM 2 locales aceptadas por la persona usuaria; revisa su correspondencia anatómica.'] : [])] };
+    warnings: ['GLB actualizado desde la pose editada en MeshingUp; revisa la deformación antes de producción.', ...(handMappingReports.length ? ['Los pesos incluyen propuestas SAM 2 locales aceptadas por la persona usuaria; revisa su correspondencia anatómica.'] : [])] };
   await transferGlb(report);
   showStatus(avatarDisplayName, 'Rig y pose editados guardados en el proyecto.');
   return report;
   } finally { operationBusy = false; }
 }
 
-window.rigmAvatar = {
+window.meshingupAvatar = {
   loadModel,
   autoRig(forwardAxis) { return autoRig(forwardAxis).catch((error) => { showStatus(avatarDisplayName, `Error de auto-rig: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
   saveEditedModel() { return saveEditedModel().catch((error) => { showStatus(avatarDisplayName, `Error al guardar: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
@@ -2455,7 +2512,11 @@ window.rigmAvatar = {
   receiveHandSegmentation,
   applyHandSegmentationProposal,
   discardHandSegmentationProposal,
-  undoHandWeightPaint,
+  undoEdit() { return editHistory.undo(); },
+  redoEdit() { return editHistory.redo(); },
+  getHistoryState() { return editHistory.state(); },
+  // Older names kept for callers; both now step the single shared history.
+  undoHandWeightPaint() { return editHistory.undo(); },
   assignHandPaintSelectionToBone,
   autoCorrectFingerWeights,
   autoCorrectSelectedBoneWeights,
@@ -2467,7 +2528,7 @@ window.rigmAvatar = {
   centerSelectedBoneOnAxis,
   applySelectedBonePivotProposal,
   discardSelectedBonePivotProposal,
-  undoFingerSkeletonFit,
+  undoFingerSkeletonFit() { return editHistory.undo(); },
   focusHand,
   focusBone,
   playHandTest,
@@ -2483,4 +2544,4 @@ window.rigmAvatar = {
   status(message) { detailLabel.textContent = String(message); },
   getInfo() { const bones = []; avatarRoot?.traverse((node) => { if (node.isBone) bones.push(node.name); }); let meshes = 0; avatarRoot?.traverse((node) => { if (node.isMesh && node.geometry?.attributes?.position) meshes++; }); return { loaded: Boolean(avatarRoot) && modelLoadState === 'loaded', loadState: modelLoadState, loadError: modelLoadError, format: vrm ? 'vrm' : 'glb', animations: gltfAnimations.map((clip) => clip.name), bones, meshes, name: avatarDisplayName }; },
 };
-window.dispatchEvent(new Event('rigm-avatar-ready'));
+window.dispatchEvent(new Event('meshingup-avatar-ready'));

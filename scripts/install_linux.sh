@@ -15,7 +15,7 @@ parts = tuple(int(part) for part in sys.argv[1].split('.')[:2])
 raise SystemExit(0 if parts >= (20, 19) else 1)
 PY
 then
-  echo "Node.js $node_version es antiguo; RigM requiere 20.19+ LTS." >&2
+  echo "Node.js $node_version es antiguo; MeshingUp requiere 20.19+ LTS." >&2
   exit 1
 fi
 
@@ -48,8 +48,8 @@ popd >/dev/null
 cat <<'EOF'
 
 Instalación lista. Ejecuta:
-  .venv/bin/rigm
-  .venv/bin/rigmctl --help
+  .venv/bin/meshingup
+  .venv/bin/meshingupctl --help
 El auto-rig y los clips 3D del visor funcionan sin Blender.
 En escritorios Linux mínimos puede ser necesario instalar las bibliotecas Qt/WebEngine del sistema.
 EOF

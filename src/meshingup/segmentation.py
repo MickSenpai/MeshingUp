@@ -17,7 +17,7 @@ def _load_model(model_id: str):
         from transformers import Sam2Model, Sam2Processor
     except ImportError as exc:
         raise RuntimeError(
-            "La segmentación SAM 2 requiere PyTorch y Transformers. Instala RigM con: "
+            "La segmentación SAM 2 requiere PyTorch y Transformers. Instala MeshingUp con: "
             "pip install -e '.[segmentation]'"
         ) from exc
 

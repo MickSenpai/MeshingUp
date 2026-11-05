@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 export default defineConfig({
   base: './',
   build: {
-    outDir: resolve(import.meta.dirname, '../src/rigm/viewer3d_static'),
+    outDir: resolve(import.meta.dirname, '../src/meshingup/viewer3d_static'),
     emptyOutDir: true,
     rollupOptions: {
       output: {

@@ -56,7 +56,7 @@ def decompose_project_with_see_through(
     group_layers: bool = True,
     split_left_right: bool = False,
 ) -> dict[str, Any]:
-    """Run the anime layer model remotely, then import its PSD as editable RigM layers.
+    """Run the anime layer model remotely, then import its PSD as editable MeshingUp layers.
 
     The caller must obtain explicit user consent before calling this function because
     the source image is uploaded to the See-through Hugging Face Space.
@@ -69,7 +69,7 @@ def decompose_project_with_see_through(
         from huggingface_hub import get_token
     except ImportError as exc:
         raise ProjectError(
-            "La separación completa requiere gradio_client. Instala RigM con: "
+            "La separación completa requiere gradio_client. Instala MeshingUp con: "
             "pip install -e '.[decomposition]'"
         ) from exc
     token = token or get_token()
@@ -86,7 +86,7 @@ def decompose_project_with_see_through(
         output_dir = project_path.parent / "assets" / "decompositions"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"see-through-{uuid.uuid4().hex[:12]}.psd"
-        with tempfile.TemporaryDirectory(prefix="rigm-see-through-") as work_dir:
+        with tempfile.TemporaryDirectory(prefix="meshingup-see-through-") as work_dir:
             input_path = Path(work_dir) / "input.png"
             square.save(input_path, format="PNG")
             client = Client(SEE_THROUGH_SPACE, token=token, verbose=False)
@@ -122,7 +122,7 @@ def decompose_project_with_see_through(
         if "upstream Gradio app has raised an exception" in detail:
             raise ProjectError(
                 "See-through recibió la solicitud, pero falló dentro del servidor de Hugging Face. "
-                "El Space no publicó la excepción interna, así que RigM no puede identificar la causa exacta. "
+                "El Space no publicó la excepción interna, así que MeshingUp no puede identificar la causa exacta. "
                 "Deja desactivada la opción experimental izquierda/derecha e inténtalo más tarde; "
                 "la cuota GPU puede haberse consumido aunque no se haya generado el PSD."
             ) from exc

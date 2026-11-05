@@ -4,7 +4,7 @@ Checks seam separation before/after weight repair on a synthetic skinned mesh.
 import ast, bpy, math
 from mathutils.kdtree import KDTree
 from pathlib import Path
-source=str(Path(__file__).resolve().parents[1] / 'src/rigm/blender_autorig.py')
+source=str(Path(__file__).resolve().parents[1] / 'src/meshingup/blender_autorig.py')
 tree=ast.parse(open(source).read())
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in {'coincident_vertex_groups','synchronize_seam_weights','evaluate_pose_stress'}:
@@ -29,4 +29,4 @@ after=evaluate_pose_stress()
 assert max(p['seam_gap_growth_height_ratio'] for p in after['poses'])<1e-4
 assert any(p['affected_edge_count'] for p in after['poses'])
 assert all(abs(sum(g.weight for g in v.groups)-1)<1e-6 for v in obj.data.vertices)
-print('RIGM_SEAM_CHECK_OK',repair)
+print('MESHINGUP_SEAM_CHECK_OK',repair)

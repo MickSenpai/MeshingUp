@@ -15,6 +15,16 @@ from typing import Any
 from PIL import Image
 from PIL import ImageChops
 
+PROJECT_FORMAT = "meshingup"
+PROJECT_EXTENSION = ".meshingup"
+# Proyectos creados antes del cambio de nombre: se siguen leyendo (marcador de
+# formato, extensión, biblioteca y carpeta de proyectos). Nunca se mueven ni se
+# reescriben a la fuerza; al guardarlos se actualiza sólo el marcador interno.
+LEGACY_FORMATS = ("rigm",)
+LEGACY_EXTENSIONS = (".rigm",)
+LEGACY_APP_DIR = "RigM"
+PROJECT_SUFFIXES = (PROJECT_EXTENSION, *LEGACY_EXTENSIONS)
+
 
 class ProjectError(ValueError):
     pass
@@ -38,8 +48,8 @@ def _read_json(path: Path) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ProjectError(f"No pude leer {path}: {exc}") from exc
-    if not isinstance(data, dict) or data.get("format") != "rigm":
-        raise ProjectError("El archivo no es un proyecto RigM.")
+    if not isinstance(data, dict) or data.get("format") not in (PROJECT_FORMAT, *LEGACY_FORMATS):
+        raise ProjectError("El archivo no es un proyecto MeshingUp.")
     if data.get("version") not in (1, 2):
         raise ProjectError(f"Versión de proyecto no compatible: {data.get('version')}.")
     return data
@@ -110,7 +120,7 @@ def save_project(
     project_path = Path(path).expanduser().resolve()
     project_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {key: value for key, value in data.items() if not key.startswith("_")}
-    payload["format"] = "rigm"
+    payload["format"] = PROJECT_FORMAT
     payload["version"] = 2
     payload.setdefault("id", str(uuid.uuid4()))
     payload.setdefault("name", project_path.stem)
@@ -508,7 +518,7 @@ def inpaint_layer_holes(
         import cv2
         import numpy as np
     except ImportError as exc:
-        raise ProjectError("El inpainting necesita el extra OpenCV. Instala RigM con: pip install '.[inpaint]'") from exc
+        raise ProjectError("El inpainting necesita el extra OpenCV. Instala MeshingUp con: pip install '.[inpaint]'") from exc
     source_path = Path(data["_image_path"])
     try:
         with Image.open(source_path) as source:
@@ -1048,7 +1058,7 @@ def import_decomposition_psd(
     try:
         from psd_tools import PSDImage
     except ImportError as exc:
-        raise ProjectError("La importación PSD requiere psd-tools. Instala RigM con: pip install -e '.[decomposition]'") from exc
+        raise ProjectError("La importación PSD requiere psd-tools. Instala MeshingUp con: pip install -e '.[decomposition]'") from exc
     project_path = Path(path).expanduser().resolve()
     source_psd = Path(psd_path).expanduser().resolve()
     data = load_project(project_path)
@@ -1100,7 +1110,7 @@ def import_decomposition_psd(
     except Exception as exc:
         raise ProjectError(f"No pude leer las capas del PSD: {exc}") from exc
     if not imported:
-        raise ProjectError("El PSD no contiene capas semánticas visibles que RigM pueda importar.")
+        raise ProjectError("El PSD no contiene capas semánticas visibles que MeshingUp pueda importar.")
 
     # Detectar resultados sospechosos sin descartar capas automáticamente: un
     # modelo puede producir piezas pequeñas válidas, pero merece revisión visual.
@@ -1193,11 +1203,16 @@ class ProjectLibrary:
         root: str | Path | None = None,
         projects_root: str | Path | None = None,
     ) -> None:
-        app_data = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "RigM"
-        self.root = Path(root or app_data).expanduser()
-        self.projects_root = Path(projects_root or (Path.home() / "RigM/Projects")).expanduser()
+        data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        self.root = Path(root or (data_home / "MeshingUp")).expanduser()
+        self.projects_root = Path(projects_root or (Path.home() / "MeshingUp/Projects")).expanduser()
+        # Sólo con las rutas por defecto: la biblioteca y la carpeta anteriores al cambio de nombre.
+        self.legacy_projects_root = Path.home() / LEGACY_APP_DIR / "Projects" if projects_root is None else None
         self.root.mkdir(parents=True, exist_ok=True)
         self.index_path = self.root / "library.json"
+        legacy_index = data_home / LEGACY_APP_DIR / "library.json"
+        if root is None and not self.index_path.exists() and legacy_index.is_file():
+            shutil.copy2(legacy_index, self.index_path)  # se copia; la biblioteca anterior queda intacta
 
     def _read_index(self) -> list[str]:
         try:
@@ -1223,12 +1238,15 @@ class ProjectLibrary:
     def list_projects(self) -> list[dict[str, Any]]:
         paths = self._read_index()
         changed = False
-        if self.projects_root.is_dir():
-            for project_path in self.projects_root.glob("*.rigm"):
-                key = str(project_path.resolve())
-                if key not in paths:
-                    paths.append(key)
-                    changed = True
+        for folder in (self.projects_root, self.legacy_projects_root):
+            if folder is None or not folder.is_dir():
+                continue
+            for suffix in PROJECT_SUFFIXES:
+                for project_path in folder.glob(f"*{suffix}"):
+                    key = str(project_path.resolve())
+                    if key not in paths:
+                        paths.append(key)
+                        changed = True
         if changed:
             self._write_index(paths)
         entries = []

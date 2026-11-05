@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProgressBar,
+    QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
     QMainWindow,
@@ -41,6 +43,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .project import (
+    PROJECT_EXTENSION, PROJECT_SUFFIXES,
     ProjectError, ProjectLibrary, analyze_mask_proposal, create_layer, create_project, extract_layer,
     accept_layer_mask_proposal, inpaint_layer_holes, load_project,
     propose_layer_masks, render_composite, save_project, validate_project,
@@ -49,14 +52,14 @@ from .project import (
 )
 from .rig import generate_layer_mesh, posed_joint_positions, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES
-from .avatar3d import analyze_avatar_parts, attach_avatar, autorig_glb, blender_available, create_avatar_project, validate_project_avatar
+from .avatar3d import analyze_avatar_parts, attach_avatar, auto_prepare_avatar, autorig_glb, blender_available, create_avatar_project, repair_avatar_mesh, validate_project_avatar
 from .avatar3d_viewer import Avatar3DDialog
 from .export import export_bundle
 from .decomposition import decompose_project_with_see_through
 from PIL import Image as PILImage, ImageDraw
 
 IMAGE_FILTER = "Imágenes (*.png *.jpg *.jpeg *.bmp *.webp)"
-PROJECT_FILTER = "Proyecto RigM (*.rigm)"
+PROJECT_FILTER = "Proyecto MeshingUp (*.meshingup *.rigm)"
 
 
 class SegmentationWorker(QThread):
@@ -124,6 +127,48 @@ class AvatarAutoRigWorker(QThread):
     def run(self) -> None:
         try:
             result = autorig_glb(self.project_path, blender_path=self.blender_path, forward_axis=self.forward_axis, actor="user", expected_mtime_ns=self.expected_mtime_ns)
+        except (OSError, ProjectError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
+class AvatarRepairWorker(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, project_path: Path, expected_mtime_ns: int | None = None):
+        super().__init__()
+        self.project_path = project_path
+        self.expected_mtime_ns = expected_mtime_ns
+
+    def run(self) -> None:
+        try:
+            result = repair_avatar_mesh(self.project_path, actor="user", expected_mtime_ns=self.expected_mtime_ns)
+        except (OSError, ProjectError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
+class AvatarPrepareWorker(QThread):
+    """Repair, rig and animate in one background job; progress lives in the manifest."""
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    progress = pyqtSignal(int, str)
+
+    def __init__(self, project_path: Path, forward_axis: str, expected_mtime_ns: int | None = None):
+        super().__init__()
+        self.project_path = project_path
+        self.forward_axis = forward_axis
+        self.expected_mtime_ns = expected_mtime_ns
+
+    def run(self) -> None:
+        try:
+            result = auto_prepare_avatar(
+                self.project_path, forward_axis=self.forward_axis, actor="user", expected_mtime_ns=self.expected_mtime_ns,
+                progress=self.progress.emit,
+            )
         except (OSError, ProjectError) as exc:
             self.failed.emit(str(exc))
         else:
@@ -289,7 +334,7 @@ class RigCanvas(QGraphicsView):
             raise ValueError("Abre una imagen antes de guardar.")
         return {
             **self.project_metadata,
-            "format": "rigm",
+            "format": "meshingup",
             "version": 1,
             "image": image_reference or str(self.image_path),
             "image_size": [self.image.width(), self.image.height()],
@@ -583,7 +628,7 @@ class RigCanvas(QGraphicsView):
 class MainWindow(QMainWindow):
     def __init__(self, library: ProjectLibrary | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("RigM · Gestor de rigs 2D")
+        self.setWindowTitle("MeshingUp · Gestor de rigs 2D")
         self.resize(1180, 760)
         self.project_path: Path | None = None
         self.loaded_mtime_ns: int | None = None
@@ -601,6 +646,8 @@ class MainWindow(QMainWindow):
         self.behavior_last_elapsed_ms = 0
         self.autorig_worker: AvatarAutoRigWorker | None = None
         self.avatar_parts_worker: AvatarPartsAnalysisWorker | None = None
+        self.avatar_repair_worker: AvatarRepairWorker | None = None
+        self.avatar_prepare_worker: AvatarPrepareWorker | None = None
         self.blender_available = blender_available()
         self.library = library or ProjectLibrary()
         self.canvas = RigCanvas()
@@ -675,7 +722,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.auto_decompose_button)
         self.import_psd_button = QPushButton("Importar PSD de See-through…")
         self.import_psd_button.setEnabled(False)
-        self.import_psd_button.setToolTip("Importa las capas de un PSD generado previamente dentro del proyecto RigM abierto.")
+        self.import_psd_button.setToolTip("Importa las capas de un PSD generado previamente dentro del proyecto MeshingUp abierto.")
         self.import_psd_button.clicked.connect(self._import_existing_decomposition_psd)
         layout.addWidget(self.import_psd_button)
         layout.addWidget(QLabel("SEGMENTACIÓN SAM 2 · PROMPTS"))
@@ -932,6 +979,19 @@ class MainWindow(QMainWindow):
         self.avatar3d_autorig_button.setEnabled(False)
         self.avatar3d_autorig_button.setToolTip("Usa la inferencia heurística de Three.js. Para mejores pesos, prueba el auto-rig de Blender.")
         self.avatar3d_autorig_button.triggered.connect(self._auto_rig_avatar3d)
+        self.avatar3d_repair_button = QAction("Reparar malla (Blender)", self)
+        self.avatar3d_repair_button.setEnabled(False)
+        self.avatar3d_repair_button.setToolTip(
+            "Suelda vértices duplicados por costuras y quita geometría muerta. El GLB original se conserva intacto; no rellena agujeros."
+        )
+        self.avatar3d_repair_button.triggered.connect(self._repair_avatar3d_mesh)
+        self.avatar3d_prepare_button = QAction("Preparar avatar completo (reparar → rig → animar)", self)
+        self.avatar3d_prepare_button.setEnabled(False)
+        self.avatar3d_prepare_button.setToolTip(
+            "Repara la malla, crea huesos y pesos con Blender y añade las animaciones base Idle y Wave. "
+            "Termina en «requiere revisión»: revisa el resultado visualmente."
+        )
+        self.avatar3d_prepare_button.triggered.connect(self._prepare_avatar3d_full)
         self.avatar3d_blender_button = QAction("Crear rig con Blender", self)
         self.avatar3d_blender_button.setEnabled(self.blender_available)
         self.avatar3d_blender_button.setToolTip(
@@ -1038,8 +1098,15 @@ class MainWindow(QMainWindow):
         avatar_menu.addAction(self.avatar3d_attach_button)
         avatar_menu.addAction(self.avatar3d_viewer_button)
         avatar_menu.addSeparator()
-        avatar_menu.addAction(self.avatar3d_parts_button)
-        front_menu = avatar_menu.addMenu("Frente del personaje")
+        avatar_menu.addAction(self.avatar3d_prepare_button)
+        steps_menu = avatar_menu.addMenu("Paso a paso")
+        steps_menu.setToolTipsVisible(True)
+        steps_menu.addAction(self.avatar3d_parts_button)
+        steps_menu.addAction(self.avatar3d_repair_button)
+        steps_menu.addAction(self.avatar3d_blender_button)
+        options_menu = avatar_menu.addMenu("Opciones")
+        options_menu.setToolTipsVisible(True)
+        front_menu = options_menu.addMenu("Frente del personaje")
         self.avatar_front_action_group = QActionGroup(self)
         self.avatar_front_action_group.setExclusive(True)
         self.avatar_front_actions: list[QAction] = []
@@ -1052,15 +1119,95 @@ class MainWindow(QMainWindow):
             )
             front_menu.addAction(action)
             self.avatar_front_actions.append(action)
-        avatar_menu.addSeparator()
-        avatar_menu.addAction(self.avatar3d_autorig_button)
-        avatar_menu.addAction(self.avatar3d_blender_button)
-        avatar_menu.addAction(self.avatar3d_rebuild_button)
+        options_menu.addAction(self.avatar3d_rebuild_button)
+        options_menu.addAction(self.avatar3d_autorig_button)
         avatar_menu.addSeparator()
         avatar_menu.addAction(self.avatar3d_top_status)
-        avatar_menu.addAction(self.avatar3d_info)
         avatar_menu.aboutToShow.connect(self._sync_avatar_menu)
         self._sync_avatar_menu()
+        self._build_job_status_bar()
+        self._build_avatar_toolbar()
+
+    # ------------------------------------------------------------------
+    # Progress feedback and the avatar toolbar
+    # ------------------------------------------------------------------
+    def _build_job_status_bar(self) -> None:
+        """A status bar visible on every tab: what is running and how far along."""
+        self._jobs: dict[str, tuple[str, int | None]] = {}
+        self.job_label = QLabel("")
+        self.job_bar = QProgressBar()
+        self.job_bar.setFixedWidth(260)
+        self.job_bar.setTextVisible(True)
+        self.job_bar.hide()
+        bar = self.statusBar()
+        bar.addWidget(self.job_label, 1)
+        bar.addPermanentWidget(self.job_bar)
+
+    def _start_job(self, key: str, text: str, percent: int | None = None) -> None:
+        """Register a running job. ``percent=None`` shows an animated busy bar."""
+        self._jobs[key] = (text, percent)
+        self._render_jobs()
+
+    def _update_job(self, key: str, text: str | None = None, percent: int | None = None) -> None:
+        if key not in self._jobs:
+            return
+        old_text, old_percent = self._jobs[key]
+        self._jobs[key] = (text if text is not None else old_text, percent if percent is not None else old_percent)
+        self._render_jobs()
+
+    def _finish_job(self, key: str, message: str | None = None) -> None:
+        self._jobs.pop(key, None)
+        self._render_jobs()
+        if message:
+            self.statusBar().showMessage(message, 6000)
+
+    def _render_jobs(self) -> None:
+        if not self._jobs:
+            self.job_bar.hide()
+            self.job_label.setText("")
+            return
+        text, percent = list(self._jobs.values())[-1]
+        extra = f"  (+{len(self._jobs) - 1} más)" if len(self._jobs) > 1 else ""
+        self.statusBar().clearMessage()
+        self.job_label.setText(text + extra)
+        if percent is None:
+            self.job_bar.setRange(0, 0)
+        else:
+            self.job_bar.setRange(0, 100)
+            self.job_bar.setValue(max(0, min(100, percent)))
+        self.job_bar.show()
+
+    def _build_avatar_toolbar(self) -> None:
+        """Main avatar steps in working order, so the primary action is not buried in a menu."""
+        for action, label in (
+            (self.avatar3d_attach_button, "Cargar GLB / VRM"),
+            (self.avatar3d_viewer_button, "Abrir vista 3D"),
+            (self.avatar3d_prepare_button, "▶ Preparar avatar completo"),
+            (self.avatar3d_parts_button, "Analizar piezas"),
+            (self.avatar3d_repair_button, "Reparar malla"),
+            (self.avatar3d_blender_button, "Crear / regenerar rig"),
+        ):
+            action.setIconText(label)
+        toolbar = QToolBar("Avatar 3D", self)
+        toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        toolbar.addAction(self.avatar3d_attach_button)
+        toolbar.addAction(self.avatar3d_viewer_button)
+        toolbar.addSeparator()
+        toolbar.addAction(self.avatar3d_prepare_button)
+        prepare_widget = toolbar.widgetForAction(self.avatar3d_prepare_button)
+        if prepare_widget is not None:
+            prepare_widget.setStyleSheet("font-weight: 600;")
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" Paso a paso: "))
+        toolbar.addAction(self.avatar3d_parts_button)
+        toolbar.addAction(self.avatar3d_repair_button)
+        toolbar.addAction(self.avatar3d_blender_button)
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" Frente: "))
+        toolbar.addWidget(self.autorig_forward_combo)
+        self.avatar_toolbar = toolbar
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
     def _sync_avatar_menu(self) -> None:
         for index, action in enumerate(self.avatar_front_actions):
@@ -1103,14 +1250,14 @@ class MainWindow(QMainWindow):
         if not image:
             return
         image_path = Path(image)
-        default_dir = Path.home() / "RigM" / "Projects"
-        default_path = default_dir / f"{image_path.stem}.rigm"
-        output, _ = QFileDialog.getSaveFileName(self, "Crear proyecto RigM", str(default_path), PROJECT_FILTER)
+        default_dir = Path.home() / "MeshingUp" / "Projects"
+        default_path = default_dir / f"{image_path.stem}.meshingup"
+        output, _ = QFileDialog.getSaveFileName(self, "Crear proyecto MeshingUp", str(default_path), PROJECT_FILTER)
         if not output:
             return
         project_path = Path(output)
-        if project_path.suffix.lower() != ".rigm":
-            project_path = project_path.with_suffix(".rigm")
+        if project_path.suffix.lower() not in PROJECT_SUFFIXES:
+            project_path = project_path.with_suffix(PROJECT_EXTENSION)
         try:
             create_project(image_path, project_path, image_path.stem)
             self.library.add(project_path)
@@ -1126,15 +1273,15 @@ class MainWindow(QMainWindow):
         if not model:
             return
         model_path = Path(model)
-        default_dir = Path.home() / "RigM" / "Projects"
+        default_dir = Path.home() / "MeshingUp" / "Projects"
         default_dir.mkdir(parents=True, exist_ok=True)
-        suggested = str(default_dir / f"{model_path.stem}.rigm")
-        output, _ = QFileDialog.getSaveFileName(self, "Crear proyecto 3D RigM", suggested, PROJECT_FILTER)
+        suggested = str(default_dir / f"{model_path.stem}.meshingup")
+        output, _ = QFileDialog.getSaveFileName(self, "Crear proyecto 3D MeshingUp", suggested, PROJECT_FILTER)
         if not output:
             return
         project_path = Path(output)
-        if project_path.suffix.casefold() != ".rigm":
-            project_path = project_path.with_suffix(".rigm")
+        if project_path.suffix.casefold() not in PROJECT_SUFFIXES:
+            project_path = project_path.with_suffix(PROJECT_EXTENSION)
         try:
             create_avatar_project(model_path, project_path, name=project_path.stem, actor="user")
             self.library.add(project_path)
@@ -1145,7 +1292,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No pude crear el proyecto 3D", str(exc))
 
     def open_project(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Abrir proyecto RigM", "", PROJECT_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir proyecto MeshingUp", "", PROJECT_FILTER)
         if not path:
             return
         try:
@@ -1203,6 +1350,10 @@ class MainWindow(QMainWindow):
             and (not avatar.get("rigged") or source_model_exists)
         )
         self.avatar3d_blender_button.setEnabled(can_blender_rig)
+        self.avatar3d_prepare_button.setEnabled(can_blender_rig)
+        self.avatar3d_repair_button.setEnabled(bool(
+            self.blender_available and avatar.get("format") == "glb" and not avatar.get("rigged")
+        ))
         self.avatar3d_blender_button.setText("Regenerar rig (Blender)" if avatar.get("rigged") else "Crear rig con Blender")
         self.avatar3d_blender_button.setToolTip(
             "Crea un rig nuevo desde el GLB original. Las correcciones del rig activo no se copian; el resultado pasa a ser el activo y se conservan hasta tres generaciones."
@@ -1219,7 +1370,7 @@ class MainWindow(QMainWindow):
             "GLB con esqueleto" if avatar.get("format") == "glb" and avatar.get("rigged")
             else "GLB sin esqueleto: puedes previsualizarlo o crear un auto-rig." if avatar.get("format") == "glb"
             else "Avatar VRM con esqueleto humanoide." if avatar.get("format") == "vrm"
-            else "Importa un GLB o VRM. RigM puede proponer huesos para un GLB sin esqueleto."
+            else "Importa un GLB o VRM. MeshingUp puede proponer huesos para un GLB sin esqueleto."
         )
         rigging = avatar.get("rigging", {})
         deformation = rigging.get("deformation_validation") if isinstance(rigging, dict) else None
@@ -1336,6 +1487,7 @@ class MainWindow(QMainWindow):
         worker.succeeded.connect(self._avatar_autorig_succeeded)
         worker.failed.connect(self._avatar_autorig_failed)
         worker.finished.connect(self._avatar_autorig_finished)
+        self._start_job("autorig", "Blender está creando huesos y pesos (puede tardar ~30 s)…")
         worker.start()
 
     def _avatar_autorig_succeeded(self, result: dict[str, Any]) -> None:
@@ -1369,6 +1521,119 @@ class MainWindow(QMainWindow):
 
     def _avatar_autorig_finished(self) -> None:
         self.autorig_worker = None
+        self._finish_job("autorig")
+
+    def _avatar_jobs_busy(self) -> bool:
+        return any(worker is not None for worker in (
+            self.autorig_worker, self.avatar_parts_worker, self.avatar_repair_worker, self.avatar_prepare_worker,
+        ))
+
+    def _set_avatar_job_buttons(self, enabled: bool) -> None:
+        for action in (self.avatar3d_repair_button, self.avatar3d_prepare_button, self.avatar3d_blender_button, self.avatar3d_parts_button):
+            action.setEnabled(enabled and self.blender_available)
+        # Importing another model while a job rewrites the project would collide with it.
+        self.avatar3d_attach_button.setEnabled(enabled and self.project_path is not None)
+
+    def _guard_external_changes(self, action: str) -> bool:
+        if self.project_path is None:
+            return False
+        if self.loaded_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
+            QMessageBox.warning(self, "Cambios externos", f"El proyecto cambió desde que lo abriste. Recárgalo antes de {action}.")
+            self.reload_button.setEnabled(True)
+            return False
+        return not self._avatar_jobs_busy()
+
+    def _repair_avatar3d_mesh(self) -> None:
+        if not self._guard_external_changes("reparar la malla"):
+            return
+        self._set_avatar_job_buttons(False)
+        self.status.setText("Blender está reparando la malla; el GLB original se conserva…")
+        worker = AvatarRepairWorker(self.project_path, expected_mtime_ns=self.loaded_mtime_ns)
+        self.avatar_repair_worker = worker
+        worker.succeeded.connect(self._avatar_repair_succeeded)
+        worker.failed.connect(self._avatar_job_failed)
+        worker.finished.connect(self._avatar_repair_finished)
+        self._start_job("repair", "Blender está reparando la malla…")
+        worker.start()
+
+    def _avatar_repair_succeeded(self, result: dict[str, Any]) -> None:
+        self._open_project_file(self.project_path)
+        self.refresh_library()
+        repair = result.get("repair", {})
+        before = sum(item.get("vertices", 0) for item in repair.get("before", {}).values())
+        after = sum(item.get("vertices", 0) for item in repair.get("after", {}).values())
+        islands_before = sum(item.get("islands", 0) for item in repair.get("before", {}).values())
+        islands_after = sum(item.get("islands", 0) for item in repair.get("after", {}).values())
+        lines = [
+            f"Vértices: {before:,} → {after:,}", f"Islas desconectadas: {islands_before:,} → {islands_after:,}",
+            "El GLB original sigue en el proyecto. Siguiente paso: «Crear rig con Blender».",
+        ]
+        if repair.get("warnings"):
+            lines.extend(["", *repair["warnings"]])
+        self.avatar3d_info.setText("Malla reparada. Revisa el resultado antes de riggear.")
+        QMessageBox.information(self, "Malla reparada", "\n".join(lines))
+
+    def _avatar_repair_finished(self) -> None:
+        self.avatar_repair_worker = None
+        self._finish_job("repair")
+        self._refresh_avatar_job_buttons()
+
+    def _prepare_avatar3d_full(self) -> None:
+        if not self._guard_external_changes("preparar el avatar"):
+            return
+        self._set_avatar_job_buttons(False)
+        self.status.setText("Preparando el avatar: reparar → rig → animar. El progreso queda en la biblioteca…")
+        worker = AvatarPrepareWorker(
+            self.project_path,
+            {"+Z": "-Y", "-Z": "+Y", "+X": "+X", "-X": "-X"}.get(self.autorig_forward_combo.currentData(), "-Y"),
+            expected_mtime_ns=self.loaded_mtime_ns,
+        )
+        self.avatar_prepare_worker = worker
+        worker.succeeded.connect(self._avatar_prepare_succeeded)
+        worker.failed.connect(self._avatar_job_failed)
+        worker.finished.connect(self._avatar_prepare_finished)
+        worker.progress.connect(lambda percent, text: self._update_job("prepare", text, percent))
+        self._start_job("prepare", "Preparando el avatar…", 0)
+        worker.start()
+
+    def _avatar_prepare_succeeded(self, result: dict[str, Any]) -> None:
+        self._open_project_file(self.project_path)
+        self.refresh_library()
+        self.avatar3d_info.setText(result.get("summary", "Avatar preparado."))
+        self.status.setText("Avatar preparado. Revisa las poses y animaciones; el proyecto queda en «requiere revisión».")
+        self._open_avatar3d_viewer()
+        lines = [result.get("summary", "")]
+        for step in result.get("steps", []):
+            for warning in step.get("warnings", []):
+                lines.append(warning)
+        QMessageBox.information(self, "Avatar preparado", "\n".join(line for line in lines if line))
+
+    def _avatar_prepare_finished(self) -> None:
+        self.avatar_prepare_worker = None
+        self._finish_job("prepare")
+        self._refresh_avatar_job_buttons()
+
+    def _avatar_job_failed(self, message: str) -> None:
+        self.avatar3d_info.setText(message)
+        self.status.setText("La operación del avatar falló. El archivo original sigue intacto.")
+        if self.project_path is not None:
+            self.refresh_library()
+        QMessageBox.warning(self, "No pude completar la operación", message)
+
+    def _refresh_avatar_job_buttons(self) -> None:
+        if self.project_path is None or self._avatar_jobs_busy():
+            return
+        avatar = load_project(self.project_path).get("avatar3d", {})
+        source = avatar.get("source_path")
+        can_rig = bool(
+            self.blender_available and avatar.get("format") == "glb"
+            and (not avatar.get("rigged") or (source and (self.project_path.parent / source).is_file()))
+        )
+        self.avatar3d_attach_button.setEnabled(True)
+        self.avatar3d_blender_button.setEnabled(can_rig)
+        self.avatar3d_prepare_button.setEnabled(can_rig)
+        self.avatar3d_parts_button.setEnabled(self.blender_available and avatar.get("format") == "glb")
+        self.avatar3d_repair_button.setEnabled(bool(self.blender_available and avatar.get("format") == "glb" and not avatar.get("rigged")))
 
     def _analyze_avatar3d_parts(self) -> None:
         if self.project_path is None:
@@ -1391,6 +1656,7 @@ class MainWindow(QMainWindow):
         worker.succeeded.connect(self._avatar_parts_analysis_succeeded)
         worker.failed.connect(self._avatar_parts_analysis_failed)
         worker.finished.connect(self._avatar_parts_analysis_finished)
+        self._start_job("parts", "Blender está analizando las piezas del modelo…")
         worker.start()
 
     def _avatar_parts_analysis_succeeded(self, result: dict[str, Any]) -> None:
@@ -1433,6 +1699,7 @@ class MainWindow(QMainWindow):
 
     def _avatar_parts_analysis_finished(self) -> None:
         self.avatar_parts_worker = None
+        self._finish_job("parts")
         if self.project_path is not None:
             data = load_project(self.project_path)
             avatar = data.get("avatar3d", {})
@@ -1461,6 +1728,7 @@ class MainWindow(QMainWindow):
         if allow_autorig_override is not None:
             allow_autorig = allow_autorig_override
         try:
+            self._finish_job("viewer")
             previous = getattr(self, "avatar3d_dialog", None)
             if previous:
                 index = self.preview_tabs.indexOf(previous)
@@ -1476,6 +1744,8 @@ class MainWindow(QMainWindow):
             )
             self.avatar3d_dialog.setWindowFlags(Qt.WindowType.Widget)
             self.avatar3d_dialog.setMinimumSize(0, 0)
+            self._start_job("viewer", "Cargando el modelo 3D en el visor…")
+            self.avatar3d_dialog.model_loading_finished.connect(lambda: self._finish_job("viewer"))
             self.avatar3d_dialog.autorig_saved.connect(self._embedded_autorig_saved)
             self.avatar3d_dialog.autorig_failed.connect(lambda message: self.avatar3d_info.setText(message))
             index = self.preview_tabs.addTab(self.avatar3d_dialog, "Vista 3D · Avatar")
@@ -1508,7 +1778,7 @@ class MainWindow(QMainWindow):
             return
         self._open_project_file(self.project_path)
         self.refresh_library()
-        self.avatar3d_info.setText("GLB actualizado. RigM conserva las versiones fuente; revisa la pose neutral, pivotes y deformación.")
+        self.avatar3d_info.setText("GLB actualizado. MeshingUp conserva las versiones fuente; revisa la pose neutral, pivotes y deformación.")
         self.status.setText("Avatar 3D actualizado en el proyecto.")
         self._open_avatar3d_viewer()
 
@@ -1571,7 +1841,7 @@ class MainWindow(QMainWindow):
             lines = [f"Estado: {result['status']}", f"Pivotes: {result['joint_count']} · Huesos: {result['bone_count']}"]
             lines.extend(f"Error: {message}" for message in result["errors"])
             lines.extend(f"Pendiente: {message}" for message in result["warnings"])
-            QMessageBox.information(self, "Validación de RigM", "\n".join(lines))
+            QMessageBox.information(self, "Validación de MeshingUp", "\n".join(lines))
         except (OSError, ProjectError) as exc:
             QMessageBox.warning(self, "No pude validar", str(exc))
 
@@ -1719,7 +1989,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Segmentación local con SAM 2",
-                "SAM 2 procesa la ilustración localmente. Si el modelo aún no está instalado, RigM descargará sus pesos oficiales de Hugging Face una vez. La imagen no se envía a ningún servicio. ¿Continuar?",
+                "SAM 2 procesa la ilustración localmente. Si el modelo aún no está instalado, MeshingUp descargará sus pesos oficiales de Hugging Face una vez. La imagen no se envía a ningún servicio. ¿Continuar?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -1741,13 +2011,14 @@ class MainWindow(QMainWindow):
         self.propose_mask_button.setEnabled(False)
         self.accept_proposal_button.setEnabled(False)
         self.status.setText("SAM 2 está proponiendo máscaras. En CPU puede tardar un poco.")
+        self._start_job("sam2", "SAM 2 está proponiendo máscaras (en CPU puede tardar)…")
         worker.start()
 
     def _import_existing_decomposition_psd(self) -> None:
         if self.project_path is None or self._project_has_external_changes():
             QMessageBox.information(
-                self, "Abre un proyecto RigM",
-                "Primero abre o crea un proyecto RigM y recarga si tiene cambios externos.",
+                self, "Abre un proyecto MeshingUp",
+                "Primero abre o crea un proyecto MeshingUp y recarga si tiene cambios externos.",
             )
             return
         psd_path, _ = QFileDialog.getOpenFileName(
@@ -1802,7 +2073,7 @@ class MainWindow(QMainWindow):
 
     def _start_ai_decomposition(self) -> None:
         if self.project_path is None or self._project_has_external_changes():
-            QMessageBox.information(self, "Guarda o recarga el proyecto", "La separación automática necesita un proyecto RigM guardado y sin cambios externos.")
+            QMessageBox.information(self, "Guarda o recarga el proyecto", "La separación automática necesita un proyecto MeshingUp guardado y sin cambios externos.")
             return
         try:
             from huggingface_hub import get_token
@@ -1814,12 +2085,12 @@ class MainWindow(QMainWindow):
                 self, "Inicia sesión en Hugging Face",
                 "See-through requiere una cuenta y un token de Hugging Face. En una terminal ejecuta:\n\n"
                 "hf auth login\n\n"
-                "Después vuelve a abrir RigM.",
+                "Después vuelve a abrir MeshingUp.",
             )
             return
         answer = QMessageBox.question(
             self, "Separación completa con IA",
-            "RigM enviará una copia cuadrada de la ilustración a See-through en Hugging Face. "
+            "MeshingUp enviará una copia cuadrada de la ilustración a See-through en Hugging Face. "
             "El servicio puede tardar unos minutos y devuelve un PSD con capas semánticas e inpainting. "
             "La imagen original del proyecto no se modifica. ¿Enviar esta imagen al servicio?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1837,6 +2108,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(self._decomposition_failed)
         worker.finished.connect(self._decomposition_finished)
         self.decomposition_worker = worker
+        self._start_job("decompose", "Separando la ilustración en capas (se envía a Hugging Face)…")
         worker.start()
 
     def _decomposition_ready(self, result: dict[str, Any]) -> None:
@@ -1867,6 +2139,7 @@ class MainWindow(QMainWindow):
 
     def _decomposition_finished(self) -> None:
         self.decomposition_worker = None
+        self._finish_job("decompose")
         self._refresh_layer_list()
 
     def _sam2_proposals_ready(self, proposals: list[dict[str, Any]]) -> None:
@@ -1883,6 +2156,7 @@ class MainWindow(QMainWindow):
 
     def _sam2_worker_finished(self) -> None:
         self.sam2_worker = None
+        self._finish_job("sam2")
         self.propose_mask_button.setEnabled(
             self.project_path is not None
             and self._selected_layer_id() is not None
@@ -2579,13 +2853,13 @@ class MainWindow(QMainWindow):
             return
         project_path = self.project_path
         if project_path is None:
-            suggested = str(Path.home() / "RigM" / "Projects" / f"{self.canvas.image_path.stem}.rigm")
-            path, _ = QFileDialog.getSaveFileName(self, "Guardar proyecto RigM", suggested, PROJECT_FILTER)
+            suggested = str(Path.home() / "MeshingUp" / "Projects" / f"{self.canvas.image_path.stem}.meshingup")
+            path, _ = QFileDialog.getSaveFileName(self, "Guardar proyecto MeshingUp", suggested, PROJECT_FILTER)
             if not path:
                 return
             project_path = Path(path)
-            if project_path.suffix.lower() != ".rigm":
-                project_path = project_path.with_suffix(".rigm")
+            if project_path.suffix.lower() not in PROJECT_SUFFIXES:
+                project_path = project_path.with_suffix(PROJECT_EXTENSION)
         try:
             if self.project_path and self.loaded_mtime_ns is not None and self.project_path.exists():
                 if self.project_path.stat().st_mtime_ns != self.loaded_mtime_ns:
@@ -2610,7 +2884,7 @@ class MainWindow(QMainWindow):
         path = path or self.project_path
         current = load_project(path) if path is not None and path.exists() else {}
         current.update({
-            "format": "rigm", "version": 2,
+            "format": "meshingup", "version": 2,
             "image": str(self.canvas.image_path),
             "image_size": [self.canvas.image.width(), self.canvas.image.height()],
             "joints": self.canvas.joints, "bones": self.canvas.bones, "layers": self.canvas.layers,
@@ -2622,7 +2896,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Guarda primero", "Guarda el proyecto antes de exportar el bundle.")
             return
         suggested = self.project_path.with_suffix(".zip")
-        output, _ = QFileDialog.getSaveFileName(self, "Exportar RigM portable", str(suggested), "Bundle RigM (*.zip)")
+        output, _ = QFileDialog.getSaveFileName(self, "Exportar MeshingUp portable", str(suggested), "Bundle MeshingUp (*.zip)")
         if not output:
             return
         try:

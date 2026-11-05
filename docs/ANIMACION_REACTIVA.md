@@ -1,10 +1,10 @@
 # Animación reactiva de personajes
 
-RigM incorpora `BehaviorRuntime`, una capa de ejecución que mezcla un clip base
+MeshingUp incorpora `BehaviorRuntime`, una capa de ejecución que mezcla un clip base
 de reposo con movimiento procedural acotado, transiciones entre estados,
 parpadeo, mirada, gestos guardados y formas de boca. Cada actualización recibe
 tiempo transcurrido en segundos y devuelve una pose temporal; no escribe el
-proyecto. El editor la expone como **Simular agente** y `rigmctl` permite
+proyecto. El editor la expone como **Simular agente** y `meshingupctl` permite
 renderizar una evidencia estática.
 
 Las conductas incluyen escucha con inclinación y asentimientos, procesamiento
@@ -22,15 +22,15 @@ No hace falta ni se debe transmitir razonamiento privado. La animación expresa
 actividad visible (por ejemplo, `thinking`), no el contenido de pensamientos.
 
 ```python
-from rigm.behavior import BehaviorRuntime, motion_event_from_agent
-from rigm.project import load_project
-from rigm.rig import render_project_pose
+from meshingup.behavior import BehaviorRuntime, motion_event_from_agent
+from meshingup.project import load_project
+from meshingup.rig import render_project_pose
 
-runtime = BehaviorRuntime(load_project("meido.rigm"))
+runtime = BehaviorRuntime(load_project("meido.meshingup"))
 runtime.dispatch(motion_event_from_agent({"type": "agent.phase", "phase": "processing"}))
 pose = runtime.update(1 / 60)
 frame = render_project_pose(
-    "meido.rigm", pose["rotations"],
+    "meido.meshingup", pose["rotations"],
     layer_visibility=pose["layer_visibility"],
     facial_parameters=pose["facial_parameters"],
     translation=pose["translation"],
@@ -45,7 +45,7 @@ proveedor de voz debe mapear sus identificadores al vocabulario normalizado
 La documentación de Azure Speech muestra que los visemas llevan tiempos de
 desplazamiento; Spine recomienda actualizar la animación con delta de tiempo y
 mezclar pistas con transiciones; Live2D documenta parámetros separados para
-mirada, parpadeo, boca y respiración. RigM adopta esos patrones sin acoplarse a
+mirada, parpadeo, boca y respiración. MeshingUp adopta esos patrones sin acoplarse a
 esos proveedores. [Azure visemas](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/how-to-speech-synthesis-viseme)
 · [Spine mezcla y actualización](https://us.esotericsoftware.com/spine-applying-animations)
 · [Parámetros estándar Live2D](https://docs.live2d.com/en/cubism-editor-manual/standard-parameter-list/).
@@ -56,14 +56,14 @@ En el editor, abre un proyecto, activa **Simular agente** y cambia el estado.
 La intensidad regula la amplitud; la pose no se guarda. Para producir un PNG:
 
 ```bash
-rigmctl behavior render meido.rigm /tmp/meido-thinking.png \
+meshingupctl behavior render meido.meshingup /tmp/meido-thinking.png \
   --state thinking --seconds 2.5 --intensity 0.45
 ```
 
 Se pueden programar señales públicas en tiempos relativos:
 
 ```bash
-rigmctl behavior render meido.rigm /tmp/meido-speaking.png \
+meshingupctl behavior render meido.meshingup /tmp/meido-speaking.png \
   --state idle --seconds 3 --event '{"at":0,"event":{"type":"agent.phase","phase":"responding"}}' \
   --event '{"at":1.1,"event":{"type":"tts.viseme","shape":"wide","duration":0.16}}'
 ```

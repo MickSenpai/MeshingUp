@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QFile, QIODevice, QUrl, Qt, QObject, QRunnable, QThreadPool, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QStandardItem, QStandardItemModel
+from PyQt6.QtGui import QKeySequence, QShortcut, QStandardItem, QStandardItemModel
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QSlider, QSplitter, QVBoxLayout, QWidget
 
 # Qt WebEngine must be imported before QApplication is instantiated. Importing
@@ -46,6 +46,7 @@ class Avatar3DDialog(QDialog):
     """Interactive local GLB/VRM viewer and host for the browser-side auto-rigger."""
 
     autorig_saved = pyqtSignal(object)
+    model_loading_finished = pyqtSignal()
     autorig_failed = pyqtSignal(str)
 
     def __init__(
@@ -73,7 +74,7 @@ class Avatar3DDialog(QDialog):
         self.autorig_requested = False
         self._sam2_confirmed = False
         self.planner = AvatarBehaviorPlanner()
-        self.setWindowTitle(f"RigM · Avatar 3D · {model_name}")
+        self.setWindowTitle(f"MeshingUp · Avatar 3D · {model_name}")
         self.resize(980, 760)
         self.setMinimumSize(540, 430)
         self.web = QWebEngineView(self)
@@ -105,7 +106,7 @@ class Avatar3DDialog(QDialog):
         if not channel_script_file.open(QIODevice.OpenModeFlag.ReadOnly):
             raise ProjectError("Qt WebEngine no pudo abrir el adaptador local de comunicación (qwebchannel.js).")
         channel_script = QWebEngineScript()
-        channel_script.setName("RigM Qt WebChannel bootstrap")
+        channel_script.setName("MeshingUp Qt WebChannel bootstrap")
         channel_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
         channel_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         channel_script.setRunsOnSubFrames(False)
@@ -115,16 +116,21 @@ class Avatar3DDialog(QDialog):
         self.bridge = Avatar3DBridge(self.project_path, self.expected_mtime_ns, self) if self.project_path else None
         self.channel = QWebChannel(self.page)
         if self.bridge:
-            self.channel.registerObject("rigmHost", self.bridge)
+            self.channel.registerObject("meshingupHost", self.bridge)
             self.bridge.saved.connect(self._autorig_saved)
             self.bridge.failed.connect(self._autorig_failed)
             self.bridge.progress.connect(self._on_progress)
+            self.bridge.history_changed.connect(self._set_history_buttons)
             self.bridge.hand_mask_ready.connect(self._on_hand_mask_ready)
         self.page.setWebChannel(self.channel)
         settings = self.web.settings()
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
         self.web.loadFinished.connect(self._on_page_loaded)
+        for keys, handler in (("Ctrl+Z", self._undo_edit), ("Ctrl+Shift+Z", self._redo_edit), ("Ctrl+Y", self._redo_edit)):
+            shortcut = QShortcut(QKeySequence(keys), self)
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(handler)
 
         controls = QHBoxLayout()
         self.state_combo = QComboBox()
@@ -137,7 +143,7 @@ class Avatar3DDialog(QDialog):
         clip_controls.addWidget(QLabel("Clip GLB"))
         self.clip_combo = QComboBox()
         self.clip_combo.setEnabled(False)
-        self.clip_combo.setMinimumWidth(150)
+        self.clip_combo.setMinimumWidth(100)
         clip_controls.addWidget(self.clip_combo, 1)
         self.play_clip_button = QPushButton("Reproducir clip")
         self.play_clip_button.setEnabled(False)
@@ -167,7 +173,7 @@ class Avatar3DDialog(QDialog):
         bone_controls = QHBoxLayout()
         bone_controls.addWidget(QLabel("Hueso"))
         self.bone_combo = QComboBox()
-        self.bone_combo.setMinimumWidth(145)
+        self.bone_combo.setMinimumWidth(110)
         self.bone_combo.setMaximumWidth(250)
         self.bone_combo.setToolTip("Huesos agrupados por región corporal. Los encabezados no son seleccionables.")
         self.bone_combo.setEnabled(False)
@@ -176,10 +182,21 @@ class Avatar3DDialog(QDialog):
         self.focus_bone_button = QPushButton("Enfocar")
         self.focus_bone_button.setToolTip("Centra y acerca la cámara al hueso seleccionado.")
         self.focus_bone_button.setEnabled(False)
-        self.focus_bone_button.clicked.connect(lambda: self._run("window.rigmAvatar?.focusBone(" + json.dumps(self.bone_combo.currentText()) + ");"))
+        self.focus_bone_button.clicked.connect(lambda: self._run("window.meshingupAvatar?.focusBone(" + json.dumps(self.bone_combo.currentText()) + ");"))
         bone_controls.addWidget(self.focus_bone_button)
         bone_view_controls = QHBoxLayout()
         bone_view_controls.setContentsMargins(0, 0, 0, 0)
+        self.undo_button = QPushButton("↶ Deshacer")
+        self.undo_button.setToolTip("Deshace la última edición de pesos o de pivotes (Ctrl+Z).")
+        self.undo_button.setEnabled(False)
+        self.undo_button.clicked.connect(self._undo_edit)
+        self.redo_button = QPushButton("↷ Rehacer")
+        self.redo_button.setToolTip("Rehace la edición deshecha (Ctrl+Shift+Z o Ctrl+Y).")
+        self.redo_button.setEnabled(False)
+        self.redo_button.clicked.connect(self._redo_edit)
+        bone_view_controls.addWidget(self.undo_button)
+        bone_view_controls.addWidget(self.redo_button)
+        bone_view_controls.addSpacing(14)
         bone_view_controls.addWidget(QLabel("Alinear vista"))
         self.bone_view_buttons: list[QPushButton] = []
         for axis, sign, label, tooltip in (
@@ -246,12 +263,12 @@ class Avatar3DDialog(QDialog):
         self.center_pivot_x = QPushButton("Centrar X")
         self.center_pivot_x.setToolTip("Alinea X del pivote con el centro geométrico del modelo. Se puede deshacer.")
         self.center_pivot_x.setEnabled(False)
-        self.center_pivot_x.clicked.connect(lambda: self._run("window.rigmAvatar?.centerSelectedBoneOnAxis('x')", self._pivot_centered))
+        self.center_pivot_x.clicked.connect(lambda: self._run("window.meshingupAvatar?.centerSelectedBoneOnAxis('x')", self._pivot_centered))
         pivot_controls.addWidget(self.center_pivot_x)
         self.center_pivot_y = QPushButton("Centrar Y")
         self.center_pivot_y.setToolTip("Alinea Y del pivote con el centro geométrico del modelo. Se puede deshacer.")
         self.center_pivot_y.setEnabled(False)
-        self.center_pivot_y.clicked.connect(lambda: self._run("window.rigmAvatar?.centerSelectedBoneOnAxis('y')", self._pivot_centered))
+        self.center_pivot_y.clicked.connect(lambda: self._run("window.meshingupAvatar?.centerSelectedBoneOnAxis('y')", self._pivot_centered))
         pivot_controls.addWidget(self.center_pivot_y)
         weight_controls = QHBoxLayout()
         ai_controls = QHBoxLayout()
@@ -271,16 +288,12 @@ class Avatar3DDialog(QDialog):
         self.ai_hand_apply = QPushButton("Aplicar propuesta")
         self.ai_hand_apply.setToolTip("Aplica los puntos amarillos al hueso seleccionado y retira su influencia de los puntos cian visibles que pertenecen a otra región. Se puede deshacer.")
         self.ai_hand_apply.setEnabled(False)
-        self.ai_hand_apply.clicked.connect(lambda: self._run("window.rigmAvatar?.applyHandSegmentationProposal()", self._ai_hand_applied))
+        self.ai_hand_apply.clicked.connect(lambda: self._run("window.meshingupAvatar?.applyHandSegmentationProposal()", self._ai_hand_applied))
         ai_controls.addWidget(self.ai_hand_apply)
         self.ai_hand_discard = QPushButton("Descartar propuesta")
         self.ai_hand_discard.setEnabled(False)
         self.ai_hand_discard.clicked.connect(self._discard_ai_hand_proposal)
         ai_controls.addWidget(self.ai_hand_discard)
-        self.undo_weight_paint = QPushButton("Deshacer pesos")
-        self.undo_weight_paint.setEnabled(False)
-        self.undo_weight_paint.clicked.connect(lambda: self._run("window.rigmAvatar?.undoHandWeightPaint()"))
-        weight_controls.addWidget(self.undo_weight_paint)
         brush_options_controls = QHBoxLayout()
         brush_options_controls.addWidget(QLabel("Radio del pincel"))
         self.brush_radius = QDoubleSpinBox()
@@ -309,7 +322,7 @@ class Avatar3DDialog(QDialog):
         self.clear_brush_selection.setEnabled(False)
         self.clear_brush_selection.clicked.connect(self._clear_brush_selection)
         brush_options_controls.addWidget(self.clear_brush_selection)
-        self.assign_brush_selection = QPushButton("Asignar selección y limpiar el resto del hueso")
+        self.assign_brush_selection = QPushButton("Asignar selección al hueso")
         self.assign_brush_selection.setToolTip(
             "Asigna al 100% del hueso seleccionado los vértices verdes y quita ese hueso de los demás vértices de la malla. "
             "Fuera de la selección conserva y normaliza otros pesos; si no queda otro, usa el hueso vecino más próximo. "
@@ -328,7 +341,7 @@ class Avatar3DDialog(QDialog):
         self.fit_hand_skeleton.setEnabled(False)
         self.fit_hand_skeleton.clicked.connect(self._fit_hand_skeleton)
         fit_controls.addWidget(self.fit_hand_skeleton)
-        self.apply_bone_pivot = QPushButton("Aplicar pivote propuesto")
+        self.apply_bone_pivot = QPushButton("Aplicar pivote")
         self.apply_bone_pivot.setEnabled(False)
         self.apply_bone_pivot.clicked.connect(self._apply_bone_pivot_proposal)
         pivot_proposal_controls.addWidget(self.apply_bone_pivot)
@@ -336,10 +349,6 @@ class Avatar3DDialog(QDialog):
         self.discard_bone_pivot.setEnabled(False)
         self.discard_bone_pivot.clicked.connect(self._discard_bone_pivot_proposal)
         pivot_proposal_controls.addWidget(self.discard_bone_pivot)
-        self.undo_hand_skeleton = QPushButton("Deshacer ajuste de pivote")
-        self.undo_hand_skeleton.setEnabled(False)
-        self.undo_hand_skeleton.clicked.connect(lambda: self._run("window.rigmAvatar?.undoFingerSkeletonFit()"))
-        fit_controls.addWidget(self.undo_hand_skeleton)
         self.hand_test_button = QPushButton("Probar movimiento del hueso")
         self.hand_test_button.setToolTip(
             "Detiene el clip actual, devuelve los demás huesos a reposo y prueba sólo el hueso seleccionado en tres ejes. "
@@ -381,63 +390,105 @@ class Avatar3DDialog(QDialog):
         self.message = QLabel("Cargando visor local… · el selector de conducta sirve para probar estados; aún no recibe eventos en vivo de Meido.")
         self.message.setWordWrap(True)
 
-        def as_option_list(source: QHBoxLayout) -> QVBoxLayout:
-            """Turn a cramped control row into a scrollable, full-width list."""
-            result = QVBoxLayout()
+        def row(*items) -> QHBoxLayout:
+            result = QHBoxLayout()
             result.setContentsMargins(0, 0, 0, 0)
             result.setSpacing(4)
-            while source.count():
-                item = source.takeAt(0)
-                widget = item.widget()
-                child_layout = item.layout()
-                if widget is not None:
-                    result.addWidget(widget)
-                elif child_layout is not None:
-                    result.addLayout(child_layout)
+            for item in items:
+                result.addWidget(item)
             return result
 
+        def labelled(text: str, widget: QWidget, *extra: QWidget) -> QHBoxLayout:
+            result = row(QLabel(text), widget, *extra)
+            result.setStretch(1, 1)
+            return result
+
+        def axis_row(spins: list[QDoubleSpinBox]) -> QHBoxLayout:
+            result = QHBoxLayout()
+            result.setContentsMargins(0, 0, 0, 0)
+            result.setSpacing(4)
+            for axis, spin in zip("XYZ", spins):
+                result.addWidget(QLabel(axis))
+                spin.setMaximumWidth(16777215)
+                result.addWidget(spin, 1)
+            return result
+
+        def group(title: str, *parts) -> QGroupBox:
+            box = QGroupBox(title)
+            layout_ = QVBoxLayout(box)
+            layout_.setContentsMargins(6, 8, 6, 6)
+            layout_.setSpacing(5)
+            for part in parts:
+                if isinstance(part, QWidget):
+                    layout_.addWidget(part)
+                else:
+                    layout_.addLayout(part)
+            return box
+
+        # Ordered by how the panel is used: preview, then pick a bone, then fix
+        # its pivot, then its weights. Saving stays visible below the scroll area.
+        animation_group = group(
+            "Animación",
+            labelled("Conducta", self.state_combo),
+            labelled("Clip GLB", self.clip_combo, self.play_clip_button),
+            labelled("Intensidad", self.intensity_slider),
+        )
+        view_widgets = ([self.autorig_button] if self.autorig_button else []) + [self.skeleton_button, self.hand_diagnostics]
+        view_group = group("Vista", *view_widgets)
+        bone_group = group(
+            "Hueso seleccionado",
+            labelled("Hueso", self.bone_combo, self.focus_bone_button),
+            QLabel("Rotación local"), axis_row(self.bone_spins),
+            QLabel("Mover pivote local"), axis_row(self.position_spins),
+            row(self.reset_bone_button, self.reset_all_bones_button),
+            self.hand_test_button,
+            self.bone_quality_label,
+        )
+        pivot_group = group(
+            "Pivotes",
+            self.drag_bone_pivot,
+            labelled("Limitar a", self.pivot_axis_combo),
+            row(self.center_pivot_x, self.center_pivot_y),
+            self.fit_hand_skeleton,
+            row(self.apply_bone_pivot, self.discard_bone_pivot),
+        )
+        weights_group = group(
+            "Pesos",
+            self.hand_weights,
+            self.weight_paint,
+            row(QLabel("Radio"), self.brush_radius, QLabel("Fuerza"), self.brush_strength),
+            self.clear_brush_selection,
+            self.assign_brush_selection,
+            self.auto_correct_hand,
+            self.ai_hand_select,
+            row(self.ai_hand_apply, self.ai_hand_discard),
+            self.weight_region_label,
+        )
         control_panel = QWidget(self)
         control_layout = QVBoxLayout(control_panel)
         control_layout.setContentsMargins(4, 4, 4, 4)
-        rig_group = QGroupBox("Esqueleto y pivotes")
-        rig_layout = QVBoxLayout(rig_group)
-        rig_layout.setContentsMargins(6, 8, 6, 6)
-        rig_layout.addLayout(as_option_list(bone_controls))
-        rig_layout.addLayout(as_option_list(bone_rotation_controls))
-        rig_layout.addLayout(as_option_list(position_controls))
-        rig_layout.addLayout(as_option_list(pivot_controls))
-        rig_layout.addLayout(as_option_list(action_controls))
-        rig_layout.addLayout(as_option_list(reset_controls))
-        rig_layout.addLayout(as_option_list(save_controls))
-        rig_layout.addWidget(self.bone_quality_label)
-
-        animation_group = QGroupBox("Animación")
-        animation_layout = QVBoxLayout(animation_group)
-        animation_layout.setContentsMargins(6, 8, 6, 6)
-        animation_layout.addLayout(as_option_list(controls))
-        animation_layout.addLayout(as_option_list(clip_controls))
-        animation_layout.addLayout(as_option_list(intensity_controls))
-
-        correction_group = QGroupBox("Diagnóstico y corrección de pesos")
-        correction_layout = QVBoxLayout(correction_group)
-        correction_layout.setContentsMargins(6, 8, 6, 6)
-        correction_layout.addLayout(as_option_list(hand_controls))
-        correction_layout.addLayout(as_option_list(weight_controls))
-        correction_layout.addLayout(as_option_list(brush_options_controls))
-        correction_layout.addLayout(as_option_list(ai_controls))
-        correction_layout.addLayout(as_option_list(fit_controls))
-        correction_layout.addLayout(as_option_list(pivot_proposal_controls))
-        correction_layout.addWidget(self.weight_region_label)
-        control_layout.addWidget(rig_group)
-        control_layout.addWidget(animation_group)
-        control_layout.addWidget(correction_group)
-        control_layout.addWidget(self.message)
+        for box in (animation_group, view_group, bone_group, pivot_group, weights_group):
+            control_layout.addWidget(box)
+        control_layout.addStretch(1)
         control_scroll = QScrollArea(self)
         control_scroll.setWidgetResizable(True)
         control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         control_scroll.setWidget(control_panel)
-        control_scroll.setMinimumWidth(285)
-        control_scroll.setMaximumWidth(390)
+        self.save_edit_button.setStyleSheet("font-weight: 600;")
+        footer = QWidget(self)
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(6, 4, 6, 6)
+        footer_layout.setSpacing(4)
+        footer_layout.addWidget(self.save_edit_button)
+        footer_layout.addWidget(self.message)
+        sidebar = QWidget(self)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(0)
+        sidebar_layout.addWidget(control_scroll, 1)
+        sidebar_layout.addWidget(footer)
+        sidebar.setMinimumWidth(320)
+        sidebar.setMaximumWidth(440)
 
         viewport = QWidget(self)
         viewport_layout = QVBoxLayout(viewport)
@@ -453,11 +504,11 @@ class Avatar3DDialog(QDialog):
 
         workspace = QSplitter(Qt.Orientation.Horizontal, self)
         workspace.setChildrenCollapsible(False)
-        workspace.addWidget(control_scroll)
+        workspace.addWidget(sidebar)
         workspace.addWidget(viewport)
         workspace.setStretchFactor(0, 0)
         workspace.setStretchFactor(1, 1)
-        workspace.setSizes([330, 760])
+        workspace.setSizes([370, 760])
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(workspace, 1)
@@ -473,17 +524,18 @@ class Avatar3DDialog(QDialog):
     def _on_page_loaded(self, ok: bool) -> None:
         if not ok:
             self.message.setText("No se pudo abrir el visor 3D local. Revisa Qt WebEngine y WebGL en el sistema.")
+            self.model_loading_finished.emit()
             return
         self.page_ready = True
         model_url = self.model_path.as_uri()
         name = self.windowTitle().split("·")[-1].strip()
         script = """(function start(tries) {
-          if (window.rigmAvatar) {
-            window.rigmAvatar.loadModel(%s, %s).then(info => {
-              window.rigmAvatar.status(`Modelo ${info.format.toUpperCase()} cargado · ${info.animations.length} clips`);
-              window.dispatchEvent(new Event('rigm-model-ready'));
+          if (window.meshingupAvatar) {
+            window.meshingupAvatar.loadModel(%s, %s).then(info => {
+              window.meshingupAvatar.status(`Modelo ${info.format.toUpperCase()} cargado · ${info.animations.length} clips`);
+              window.dispatchEvent(new Event('meshingup-model-ready'));
             }).catch(error => {
-              window.rigmAvatar.status(`Error cargando modelo: ${error.message}`);
+              window.meshingupAvatar.status(`Error cargando modelo: ${error.message}`);
             });
             return;
           }
@@ -505,12 +557,12 @@ class Avatar3DDialog(QDialog):
             self.autorig_button.setText("Calculando pesos…")
         self.message.setText("Esperando a que termine de cargar el modelo…" if not self.model_ready else "Preparando el análisis de pesos…")
         if self.page_ready and self.model_ready:
-            self._run("window.rigmAvatar?.autoRig(" + json.dumps(self.forward_axis) + ").catch(() => {});")
+            self._run("window.meshingupAvatar?.autoRig(" + json.dumps(self.forward_axis) + ").catch(() => {});")
 
     def _poll_model_load(self, attempts: int) -> None:
         if not self.page_ready or self.model_ready:
             return
-        self._run("window.rigmAvatar?.getInfo() || null", lambda info: self._model_load_status(info, attempts))
+        self._run("window.meshingupAvatar?.getInfo() || null", lambda info: self._model_load_status(info, attempts))
 
     def _model_load_status(self, info: Any, attempts: int) -> None:
         if isinstance(info, dict) and info.get("loaded"):
@@ -525,6 +577,7 @@ class Avatar3DDialog(QDialog):
         QTimer.singleShot(200, lambda: self._poll_model_load(attempts - 1))
 
     def _model_load_finished(self, result: Any) -> None:
+        self.model_loading_finished.emit()
         if not isinstance(result, dict) or not result.get("ok"):
             detail = result.get("error", "El visor no devolvió información del modelo.") if isinstance(result, dict) else "El visor no devolvió información del modelo."
             self.message.setText(f"No se pudo mostrar el modelo: {detail}")
@@ -536,7 +589,7 @@ class Avatar3DDialog(QDialog):
         self.model_ready = True
         landmark_diagnostics = self.rigging_report.get("bone_landmark_diagnostics", {})
         if landmark_diagnostics:
-            self._run("window.rigmAvatar?.setBoneLandmarkDiagnostics(" + json.dumps(landmark_diagnostics, ensure_ascii=False) + ");")
+            self._run("window.meshingupAvatar?.setBoneLandmarkDiagnostics(" + json.dumps(landmark_diagnostics, ensure_ascii=False) + ");")
         self.clip_combo.blockSignals(True)
         self.clip_combo.clear()
         self.clip_combo.addItems([str(name) for name in result.get("animations", []) if name])
@@ -552,12 +605,12 @@ class Avatar3DDialog(QDialog):
         self._send_state()
         self._receive_bones(result, 0)
         if self.autorig_requested:
-            self._run("window.rigmAvatar?.autoRig(" + json.dumps(self.forward_axis) + ").catch(() => {});")
+            self._run("window.meshingupAvatar?.autoRig(" + json.dumps(self.forward_axis) + ").catch(() => {});")
 
     def _play_selected_clip(self) -> None:
         name = self.clip_combo.currentText()
         if name:
-            self._run("window.rigmAvatar?.playClip(" + json.dumps(name) + ", {loop: true});")
+            self._run("window.meshingupAvatar?.playClip(" + json.dumps(name) + ", {loop: true});")
 
     def _on_progress(self, message: str) -> None:
         self.message.setText(str(message))
@@ -585,16 +638,16 @@ class Avatar3DDialog(QDialog):
         except ProjectError as exc:
             self.message.setText(str(exc))
             return
-        self._run("window.rigmAvatar?.setPlan(" + json.dumps(plan, ensure_ascii=False) + ");")
+        self._run("window.meshingupAvatar?.setPlan(" + json.dumps(plan, ensure_ascii=False) + ");")
 
     def _send_intensity(self, value: int) -> None:
         plan = self.planner.dispatch({"type": "parameter", "name": "intensity", "value": value / 100})
-        self._run("window.rigmAvatar?.setPlan(" + json.dumps(plan, ensure_ascii=False) + ");")
+        self._run("window.meshingupAvatar?.setPlan(" + json.dumps(plan, ensure_ascii=False) + ");")
 
     def _refresh_bones(self, attempts: int = 0) -> None:
         if not self.page_ready:
             return
-        self._run("window.rigmAvatar?.getInfo()", lambda info: self._receive_bones(info, attempts))
+        self._run("window.meshingupAvatar?.getInfo()", lambda info: self._receive_bones(info, attempts))
 
     def _receive_bones(self, info: Any, attempts: int) -> None:
         bones = info.get("bones", []) if isinstance(info, dict) else []
@@ -661,10 +714,8 @@ class Avatar3DDialog(QDialog):
         self.center_pivot_x.setEnabled(enabled and info.get("format") == "glb")
         self.center_pivot_y.setEnabled(enabled and info.get("format") == "glb")
         self.pivot_axis_combo.setEnabled(enabled and info.get("format") == "glb")
-        self.undo_weight_paint.setEnabled(enabled)
         self.auto_correct_hand.setEnabled(enabled)
         self.fit_hand_skeleton.setEnabled(enabled)
-        self.undo_hand_skeleton.setEnabled(enabled)
         self.hand_test_button.setEnabled(enabled)
         self.focus_bone_button.setEnabled(enabled)
         self.save_edit_button.setEnabled(enabled and self.bridge is not None and info.get("format") == "glb")
@@ -673,18 +724,35 @@ class Avatar3DDialog(QDialog):
         elif isinstance(info, dict) and info.get("loaded"):
             self.message.setText("El modelo cargó, pero no contiene huesos. Crea el auto-rig para inspeccionarlos y editarlos.")
         if enabled:
-            self._run("window.rigmAvatar?.selectBone(" + json.dumps(self.bone_combo.currentText()) + ");")
+            self._run("window.meshingupAvatar?.selectBone(" + json.dumps(self.bone_combo.currentText()) + ");")
+
+    def _undo_edit(self) -> None:
+        self._run("window.meshingupAvatar?.undoEdit()", lambda _result: self._refresh_history_buttons())
+
+    def _redo_edit(self) -> None:
+        self._run("window.meshingupAvatar?.redoEdit()", lambda _result: self._refresh_history_buttons())
+
+    def _set_history_buttons(self, can_undo: bool, can_redo: bool) -> None:
+        self.undo_button.setEnabled(bool(can_undo))
+        self.redo_button.setEnabled(bool(can_redo))
+
+    def _refresh_history_buttons(self) -> None:
+        """Ask the viewer for the history state (used when no host bridge pushes it)."""
+        def apply(state: Any) -> None:
+            if isinstance(state, dict):
+                self._set_history_buttons(bool(state.get("canUndo")), bool(state.get("canRedo")))
+        self._run("window.meshingupAvatar?.getHistoryState()", apply)
 
     def _toggle_skeleton(self, visible: bool) -> None:
         self.skeleton_button.setText("Ocultar esqueleto" if visible else "Mostrar esqueleto")
-        self._run("window.rigmAvatar?.setSkeletonVisible(" + ("true" if visible else "false") + ");")
+        self._run("window.meshingupAvatar?.setSkeletonVisible(" + ("true" if visible else "false") + ");")
 
     def _toggle_hand_diagnostics(self, visible: bool) -> None:
-        self._run("window.rigmAvatar?.setHandDiagnostics(" + ("true" if visible else "false") + ");")
+        self._run("window.meshingupAvatar?.setHandDiagnostics(" + ("true" if visible else "false") + ");")
 
     def _toggle_hand_weights(self, visible: bool) -> None:
         bone = self.bone_combo.currentText()
-        self._run("window.rigmAvatar?.setBoneWeightDiagnostics(" + ("true" if visible else "false") + "," + json.dumps(bone) + ");")
+        self._run("window.meshingupAvatar?.setBoneWeightDiagnostics(" + ("true" if visible else "false") + "," + json.dumps(bone) + ");")
 
     def _configure_bone_pivot_drag(self, enabled: bool) -> None:
         if enabled:
@@ -693,7 +761,7 @@ class Avatar3DDialog(QDialog):
             if self.ai_hand_select.isChecked():
                 self.ai_hand_select.setChecked(False)
         self._run(
-            "window.rigmAvatar?.configureBonePivotDrag(" + json.dumps(bool(enabled)) + ")",
+            "window.meshingupAvatar?.configureBonePivotDrag(" + json.dumps(bool(enabled)) + ")",
             self._bone_pivot_drag_configured,
         )
 
@@ -709,11 +777,11 @@ class Avatar3DDialog(QDialog):
 
     def _set_pivot_axis_constraint(self, _index: int = -1) -> None:
         axis = self.pivot_axis_combo.currentData()
-        self._run("window.rigmAvatar?.configureBonePivotAxis(" + json.dumps(axis or "view") + ");")
+        self._run("window.meshingupAvatar?.configureBonePivotAxis(" + json.dumps(axis or "view") + ");")
 
     def _set_avatar_view(self, axis: str, sign: int) -> None:
         self._run(
-            "window.rigmAvatar?.setViewAxis(" + json.dumps(axis) + "," + str(int(sign)) + ")",
+            "window.meshingupAvatar?.setViewAxis(" + json.dumps(axis) + "," + str(int(sign)) + ")",
             self._avatar_view_changed,
         )
 
@@ -733,9 +801,8 @@ class Avatar3DDialog(QDialog):
                 self.ai_hand_select.setChecked(False)
         bone = self.bone_combo.currentText()
         options = {"radiusRatio": self.brush_radius.value() / 100, "strength": self.brush_strength.value() / 100}
-        self._run("window.rigmAvatar?.configureHandWeightPaint(" + json.dumps(bool(enabled)) + "," + json.dumps(bone) + "," + json.dumps(options) + ");")
+        self._run("window.meshingupAvatar?.configureHandWeightPaint(" + json.dumps(bool(enabled)) + "," + json.dumps(bone) + "," + json.dumps(options) + ");")
         can_edit_weights = self.model_ready and self.model_path.suffix.casefold() == ".glb"
-        self.undo_weight_paint.setEnabled(can_edit_weights)
         self.assign_brush_selection.setEnabled(can_edit_weights)
 
     def _brush_options_changed(self, _value: float = 0.0) -> None:
@@ -743,12 +810,12 @@ class Avatar3DDialog(QDialog):
             self._configure_weight_paint(True)
 
     def _clear_brush_selection(self) -> None:
-        self._run("window.rigmAvatar?.clearHandPaintSelection()")
+        self._run("window.meshingupAvatar?.clearHandPaintSelection()")
         self.message.setText("Se limpió la marca verde del pincel; los pesos aplicados no cambiaron.")
 
     def _assign_brush_selection_to_bone(self) -> None:
         self._run(
-            "window.rigmAvatar?.assignHandPaintSelectionToBone()",
+            "window.meshingupAvatar?.assignHandPaintSelectionToBone()",
             self._hand_paint_selection_assigned,
         )
 
@@ -757,14 +824,14 @@ class Avatar3DDialog(QDialog):
             return
         self.message.setText(str(result.get("message", "No se pudo asignar la selección.")))
         if result.get("changed"):
-            self.undo_weight_paint.setEnabled(True)
+            self._refresh_history_buttons()
 
     def _configure_ai_hand_selection(self, enabled: bool) -> None:
         if enabled and not self._sam2_confirmed:
             answer = QMessageBox.question(
                 self, "Análisis local de región con SAM 2",
                 "SAM 2 procesará localmente una captura de la vista 3D y el punto que marques sobre la región del hueso seleccionado. "
-                "Si el modelo aún no está en caché, RigM descargará sus pesos oficiales una vez. "
+                "Si el modelo aún no está en caché, MeshingUp descargará sus pesos oficiales una vez. "
                 "La captura no se enviará a un servicio remoto. ¿Continuar?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
@@ -778,13 +845,13 @@ class Avatar3DDialog(QDialog):
         if enabled and self.weight_paint.isChecked():
             self.weight_paint.setChecked(False)
         bone = self.bone_combo.currentText()
-        self._run("window.rigmAvatar?.configureHandSegmentation(" + json.dumps(bool(enabled)) + "," + json.dumps(bone) + ");")
+        self._run("window.meshingupAvatar?.configureHandSegmentation(" + json.dumps(bool(enabled)) + "," + json.dumps(bone) + ");")
         if enabled:
             self.ai_hand_apply.setEnabled(False)
             self.message.setText(f"Enfoca {bone}, marca la región visible que quieras mapear y revisa la propuesta local de SAM 2.")
 
     def _discard_ai_hand_proposal(self) -> None:
-        self._run("window.rigmAvatar?.discardHandSegmentationProposal()")
+        self._run("window.meshingupAvatar?.discardHandSegmentationProposal()")
         self.ai_hand_apply.setEnabled(False)
         self.ai_hand_discard.setEnabled(False)
         self.message.setText("Propuesta de segmentación descartada.")
@@ -801,7 +868,7 @@ class Avatar3DDialog(QDialog):
         except (TypeError, json.JSONDecodeError):
             result = {"error": "Respuesta de SAM 2 inválida."}
         # runJavaScript does not await a Promise returned by an async function.
-        self._run("window.rigmHandPreviewResult = null; window.rigmAvatar.receiveHandSegmentation(" + json.dumps(job_id) + "," + json.dumps(result, ensure_ascii=False) + ").then(r => window.rigmHandPreviewResult = r).catch(e => window.rigmHandPreviewResult = {ready:false,message:String(e)});")
+        self._run("window.meshingupHandPreviewResult = null; window.meshingupAvatar.receiveHandSegmentation(" + json.dumps(job_id) + "," + json.dumps(result, ensure_ascii=False) + ").then(r => window.meshingupHandPreviewResult = r).catch(e => window.meshingupHandPreviewResult = {ready:false,message:String(e)});")
         self._poll_hand_preview(2400)
 
     def _poll_hand_preview(self, attempts: int) -> None:
@@ -812,7 +879,7 @@ class Avatar3DDialog(QDialog):
                 QTimer.singleShot(100, lambda: self._poll_hand_preview(attempts - 1))
             else:
                 self.message.setText("El visor no confirmó la propuesta; vuelve a marcar la región.")
-        self._run("window.rigmHandPreviewResult", received)
+        self._run("window.meshingupHandPreviewResult", received)
 
     def _hand_segmentation_previewed(self, result: Any) -> None:
         if isinstance(result, dict):
@@ -824,7 +891,7 @@ class Avatar3DDialog(QDialog):
         bone = self.bone_combo.currentText()
         if not self.hand_weights.isChecked():
             self.hand_weights.setChecked(True)
-        self._run("window.rigmAvatar?.autoCorrectSelectedBoneWeights(" + json.dumps(bone) + ")", self._auto_correct_hand_finished)
+        self._run("window.meshingupAvatar?.autoCorrectSelectedBoneWeights(" + json.dumps(bone) + ")", self._auto_correct_hand_finished)
 
     def _auto_correct_hand_finished(self, result: Any) -> None:
         if not isinstance(result, dict):
@@ -833,7 +900,7 @@ class Avatar3DDialog(QDialog):
 
     def _fit_hand_skeleton(self) -> None:
         bone = self.bone_combo.currentText()
-        self._run("window.rigmAvatar?.centerSelectedBonePivotOnWeights(" + json.dumps(bone) + ")", self._fit_hand_skeleton_finished)
+        self._run("window.meshingupAvatar?.centerSelectedBonePivotOnWeights(" + json.dumps(bone) + ")", self._fit_hand_skeleton_finished)
 
     def _fit_hand_skeleton_finished(self, result: Any) -> None:
         if isinstance(result, dict):
@@ -843,7 +910,7 @@ class Avatar3DDialog(QDialog):
             self.discard_bone_pivot.setEnabled(proposed)
 
     def _apply_bone_pivot_proposal(self) -> None:
-        self._run("window.rigmAvatar?.applySelectedBonePivotProposal()", self._bone_pivot_proposal_applied)
+        self._run("window.meshingupAvatar?.applySelectedBonePivotProposal()", self._bone_pivot_proposal_applied)
 
     def _bone_pivot_proposal_applied(self, result: Any) -> None:
         self.apply_bone_pivot.setEnabled(False)
@@ -852,14 +919,14 @@ class Avatar3DDialog(QDialog):
             self.message.setText(str(result.get("message", "Propuesta de pivote aplicada.")))
 
     def _discard_bone_pivot_proposal(self) -> None:
-        self._run("window.rigmAvatar?.discardSelectedBonePivotProposal()")
+        self._run("window.meshingupAvatar?.discardSelectedBonePivotProposal()")
         self.apply_bone_pivot.setEnabled(False)
         self.discard_bone_pivot.setEnabled(False)
         self.message.setText("Propuesta de pivote descartada; el rig no cambió.")
 
     def _play_hand_test(self) -> None:
         bone = self.bone_combo.currentText()
-        self._run("window.rigmAvatar?.playSelectedBoneTest(" + json.dumps(bone) + ")", lambda result: self.message.setText(str(result.get("message", "Prueba de movimiento iniciada.")) if isinstance(result, dict) else "Prueba de movimiento iniciada."))
+        self._run("window.meshingupAvatar?.playSelectedBoneTest(" + json.dumps(bone) + ")", lambda result: self.message.setText(str(result.get("message", "Prueba de movimiento iniciada.")) if isinstance(result, dict) else "Prueba de movimiento iniciada."))
 
     def _select_bone(self, name: str) -> None:
         if not name:
@@ -884,13 +951,13 @@ class Avatar3DDialog(QDialog):
             extra = " Hips es el control central de pelvis; el mapa de puntos muestra sus pesos, no dos pivotes laterales." if name.lower() == "hips" else ""
             self.bone_quality_label.setText(f"{name} · sin diagnóstico geométrico individual; confirma su pivote visualmente.{extra}")
             self.bone_quality_label.setStyleSheet("color: #9a4b00;")
-        self._run("window.rigmAvatar?.selectBone(" + json.dumps(name) + ");")
+        self._run("window.meshingupAvatar?.selectBone(" + json.dumps(name) + ");")
         if self.weight_paint.isChecked():
             self._configure_weight_paint(True)
         if self.ai_hand_select.isChecked():
             self._configure_ai_hand_selection(True)
-        self._run("window.rigmAvatar?.getBoneRotation(" + json.dumps(name) + ")", self._receive_bone_rotation)
-        self._run("window.rigmAvatar?.getBonePosition(" + json.dumps(name) + ")", self._receive_bone_position)
+        self._run("window.meshingupAvatar?.getBoneRotation(" + json.dumps(name) + ")", self._receive_bone_rotation)
+        self._run("window.meshingupAvatar?.getBonePosition(" + json.dumps(name) + ")", self._receive_bone_position)
 
     def _receive_bone_rotation(self, values: Any) -> None:
         if not isinstance(values, list) or len(values) != 3:
@@ -905,7 +972,7 @@ class Avatar3DDialog(QDialog):
         if not name:
             return
         rotation = [spin.value() for spin in self.bone_spins]
-        self._run("window.rigmAvatar?.setBoneRotation(" + json.dumps(name) + "," + json.dumps(rotation) + ");")
+        self._run("window.meshingupAvatar?.setBoneRotation(" + json.dumps(name) + "," + json.dumps(rotation) + ");")
 
     def _receive_bone_position(self, values: Any) -> None:
         if not isinstance(values, list) or len(values) != 3:
@@ -919,12 +986,12 @@ class Avatar3DDialog(QDialog):
         name = self.bone_combo.currentText()
         if name:
             position = [spin.value() for spin in self.position_spins]
-            self._run("window.rigmAvatar?.setBonePosition(" + json.dumps(name) + "," + json.dumps(position) + ");")
+            self._run("window.meshingupAvatar?.setBonePosition(" + json.dumps(name) + "," + json.dumps(position) + ");")
 
     def _reset_selected_bone(self) -> None:
         name = self.bone_combo.currentText()
         if name:
-            self._run("window.rigmAvatar?.resetBone(" + json.dumps(name) + ");")
+            self._run("window.meshingupAvatar?.resetBone(" + json.dumps(name) + ");")
             for spin in self.bone_spins:
                 spin.blockSignals(True)
                 spin.setValue(0)
@@ -937,7 +1004,7 @@ class Avatar3DDialog(QDialog):
     def _reset_all_bones(self) -> None:
         if not self.bone_combo.count():
             return
-        self._run("window.rigmAvatar?.resetAllBones();")
+        self._run("window.meshingupAvatar?.resetAllBones();")
         for spin in (*self.bone_spins, *self.position_spins):
             spin.blockSignals(True)
             spin.setValue(0)
@@ -946,12 +1013,12 @@ class Avatar3DDialog(QDialog):
 
     def save_edited_model(self) -> None:
         if self.page_ready:
-            self._run("window.rigmAvatar?.saveEditedModel().catch(() => {});")
+            self._run("window.meshingupAvatar?.saveEditedModel().catch(() => {});")
 
     def dispatch_agent_event(self, event: dict[str, Any]) -> dict[str, Any]:
         """Update the avatar from a public Meido status/TTS event."""
         plan = self.planner.dispatch(event)
-        self._run("window.rigmAvatar?.setPlan(" + json.dumps(plan, ensure_ascii=False) + ");")
+        self._run("window.meshingupAvatar?.setPlan(" + json.dumps(plan, ensure_ascii=False) + ");")
         return plan
 
 
@@ -980,7 +1047,7 @@ class _HandMaskTask(QRunnable):
                 width, height = image.size
             if width < 32 or height < 32 or not (0 <= self.x < width and 0 <= self.y < height):
                 raise ProjectError("El punto guía está fuera de la captura o la imagen es demasiado pequeña.")
-            with tempfile.NamedTemporaryFile(prefix="rigm-hand-sam-", suffix=".png", delete=False) as handle:
+            with tempfile.NamedTemporaryFile(prefix="meshingup-hand-sam-", suffix=".png", delete=False) as handle:
                 handle.write(raw)
                 image_path = Path(handle.name)
             try:
@@ -1007,6 +1074,7 @@ class Avatar3DBridge(QObject):
     failed = pyqtSignal(str)
     progress = pyqtSignal(str)
     hand_mask_ready = pyqtSignal(str, str)
+    history_changed = pyqtSignal(bool, bool)
 
     def __init__(self, project_path: Path, expected_mtime_ns: int | None, parent=None):
         super().__init__(parent)
@@ -1031,6 +1099,11 @@ class Avatar3DBridge(QObject):
         self.hand_tasks = [task for task in self.hand_tasks if task.job_id != job_id]
         self.hand_mask_ready.emit(job_id, result_json)
 
+    @pyqtSlot(bool, bool, result=bool)
+    def historyChanged(self, can_undo: bool, can_redo: bool) -> bool:
+        self.history_changed.emit(bool(can_undo), bool(can_redo))
+        return True
+
     @pyqtSlot(str, result=bool)
     def reportProgress(self, message: str) -> bool:
         self.progress.emit(message)
@@ -1047,7 +1120,7 @@ class Avatar3DBridge(QObject):
             if total_bytes < 20 or total_bytes > 512 * 1024 * 1024:
                 raise ProjectError("El GLB generado tiene un tamaño inválido o supera 512 MB.")
             if self.project_path is None or not self.project_path.is_file():
-                raise ProjectError("El proyecto RigM ya no está disponible.")
+                raise ProjectError("El proyecto MeshingUp ya no está disponible.")
             if self.expected_mtime_ns is not None and self.project_path.stat().st_mtime_ns != self.expected_mtime_ns:
                 raise ProjectError("El proyecto cambió externamente; recárgalo antes de guardar el esqueleto.")
             data = load_project(self.project_path)
@@ -1058,7 +1131,7 @@ class Avatar3DBridge(QObject):
             if not isinstance(report, dict):
                 raise ProjectError("El informe del auto-rig no tiene formato válido.")
             transfer_id = uuid.uuid4().hex
-            handle = tempfile.NamedTemporaryFile(prefix="rigm-autorig-", suffix=".glb", delete=False)
+            handle = tempfile.NamedTemporaryFile(prefix="meshingup-autorig-", suffix=".glb", delete=False)
             self.transfers[transfer_id] = {
                 "handle": handle, "path": Path(handle.name), "size": total_bytes,
                 "written": 0, "name": model_name, "report": report,
@@ -1102,7 +1175,7 @@ class Avatar3DBridge(QObject):
             result = attach_avatar(self.project_path, transfer["path"], actor="user", extra_metadata={
                 "name": transfer["name"],
                 "source_path": transfer["source_path"], "source_sha256": transfer["source_sha256"],
-                "rigging": {"method": report.get("method", "rigm_threejs_geometry_autorig"), **report},
+                "rigging": {"method": report.get("method", "meshingup_threejs_geometry_autorig"), **report},
             })
             self.saved.emit(result)
             return True

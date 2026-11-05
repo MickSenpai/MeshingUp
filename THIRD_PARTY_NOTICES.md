@@ -2,10 +2,10 @@
 
 ## Mesh2Motion weight-correction approach
 
-RigM's Blender auto-rig includes an independent Python adaptation of the
+MeshingUp's Blender auto-rig includes an independent Python adaptation of the
 head-versus-arm and torso-versus-arm weight-correction approaches used by
 [Mesh2Motion](https://github.com/Mesh2Motion/mesh2motion-app), especially its
-`HeadWeightCorrector` and `ArmWeightCorrector` solvers. RigM does not bundle or
+`HeadWeightCorrector` and `ArmWeightCorrector` solvers. MeshingUp does not bundle or
 depend on Mesh2Motion source code. The adaptation is credited under the
 upstream project's MIT license:
 
