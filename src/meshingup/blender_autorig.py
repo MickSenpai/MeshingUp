@@ -139,8 +139,27 @@ def hair_masks_from_texture():
         if spread > 10.0:
             stats["reason"] = f"la corona no tiene un color uniforme (dispersión {spread:.1f})"
             continue
+        distances = np.linalg.norm(lab - crown_colour, axis=1)
         tolerance = min(22.0, max(12.0, 8.0 * spread))
-        mask = np.linalg.norm(lab - crown_colour, axis=1) < tolerance
+        # Adaptive threshold: look for the valley between the hair-coloured mode
+        # (near the crown colour) and everything else. Without a clear valley the
+        # colour classifier cannot be trusted and the geometric method is used.
+        histogram, _bin_edges = np.histogram(distances, bins=np.arange(0.0, 41.0, 1.0))
+        density = np.convolve(histogram.astype(float), np.ones(3) / 3.0, mode="same")
+        low, high = 6, 22
+        valley = int(low + np.argmin(density[low:high + 1]))
+        side_peak = float(density[:valley].max()) if valley > 0 else 0.0
+        later_peak = float(density[valley + 1:].max()) if valley + 1 < len(density) else 0.0
+        valley_ratio = float(density[valley] / max(1.0, min(side_peak, later_peak)))
+        threshold_method = "crown_spread"
+        if valley_ratio < 0.6 and low < valley < high:
+            tolerance = float(valley) + 0.5
+            threshold_method = "histogram_valley"
+        elif float((distances < tolerance).mean()) > 0.45:
+            stats["reason"] = (f"sin valle claro entre pelo y resto de colores y {float((distances < tolerance).mean()):.0%} "
+                               f"de los vértices quedarían como pelo (dispersión {spread:.1f})")
+            continue
+        mask = distances < tolerance
         edges = np.empty(len(mesh.edges) * 2, dtype=np.int32)
         mesh.edges.foreach_get("vertices", edges)
         edges = edges.reshape(-1, 2)
@@ -179,13 +198,14 @@ def hair_masks_from_texture():
         disconnected = int((mask & ~connected).sum())
         mask = mask & connected
         fraction = float(mask.mean())
-        if not 0.03 <= fraction <= 0.80:
+        if not 0.03 <= fraction <= 0.40:
             stats["reason"] = f"fracción de pelo implausible ({fraction:.0%})"
             continue
         hair_texture_masks[obj.name] = mask
         stats.update({
             "used": True, "crown_lab": [round(float(v), 1) for v in crown_colour], "crown_spread": round(spread, 2),
-            "tolerance": round(tolerance, 1), "hair_vertices_before_filter": raw_hair,
+            "tolerance": round(tolerance, 1), "threshold_method": threshold_method, "valley_ratio": round(valley_ratio, 3),
+            "hair_vertices_before_filter": raw_hair,
             "hair_vertices": int(mask.sum()), "hair_fraction": round(fraction, 3),
             "hair_coloured_but_not_connected_to_crown": disconnected,
             "note": "Heurística de color: se aprende el color del pelo en la corona y se conservan las regiones de ese color conectadas a ella. No es separación semántica confirmada; revisa los contactos pelo/ropa.",
