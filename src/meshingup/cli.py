@@ -283,6 +283,8 @@ def main() -> None:
             _emit(result)
             if result["errors"]:
                 raise SystemExit(2)
+            if result["warnings"]:
+                raise SystemExit(1)
         elif args.command == "joint" and args.joint_action == "add":
             joint_id = add_joint(args.project, args.name, args.x, args.y)
             _emit({"joint_id": joint_id})

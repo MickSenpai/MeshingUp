@@ -468,7 +468,7 @@ function moveBonePivotToWorld(bone, targetWorld, { method = 'manual_pivot_edit',
   if (!bone?.parent || !avatarRoot) return { moved: false, message: 'El hueso seleccionado no tiene un pivote editable.' };
   avatarRoot.updateMatrixWorld(true);
   if (bone.getWorldPosition(new THREE.Vector3()).distanceTo(targetWorld) < 1e-9) return { moved: false, message: `El pivote ${bone.name} ya está en esa posición.` };
-  const action = captureBonePivotAction(bone);
+  const action = captureBonePivotAction(bone, moveBoneSection ? [] : nearestDescendantBones(bone));
   bone.position.copy(bone.parent.worldToLocal(targetWorld.clone()));
   avatarRoot.updateMatrixWorld(true);
   for (const [child, worldPosition] of action.childWorldPositions) {
@@ -480,11 +480,11 @@ function moveBonePivotToWorld(bone, targetWorld, { method = 'manual_pivot_edit',
   }
   updatePivotOffsets(bone, action.children);
   const pivotEdit = {
-    bone: bone.name, method, start_world: action.startWorld.toArray(),
+    bone: bone.name, method, include_descendants: moveBoneSection, start_world: action.startWorld.toArray(),
     end_world: targetWorld.toArray(), confidence: 'user_review',
   };
   action.pivotEdit = pivotEdit;
-  action.kind = coalesce ? 'bone_position_control' : 'bone_pivot';
+  action.kind = coalesce ? (moveBoneSection ? 'bone_section_control' : 'bone_position_control') : 'bone_pivot';
   action.boneName = bone.name;
   const last = editHistory.peek('bones');
   if (coalesce && last?.kind === action.kind && last.boneName === bone.name) {
@@ -493,7 +493,7 @@ function moveBonePivotToWorld(bone, targetWorld, { method = 'manual_pivot_edit',
     editHistory.record('bones', action);
     bonePivotEdits.push(pivotEdit);
   }
-  return { moved: true, action, message: `Se movió ${bone.name} y se mantuvieron ancladas sus articulaciones descendientes.` };
+  return { moved: true, action, message: moveBoneSection ? `Se movió la sección ${bone.name} con todas sus articulaciones descendientes.` : `Se movió ${bone.name} y se mantuvieron ancladas sus articulaciones descendientes.` };
 }
 
 function beginBonePivotDrag(event) {
@@ -513,9 +513,9 @@ function beginBonePivotDrag(event) {
   pivotDragRaycaster.setFromCamera(pivotDragNdc, camera);
   const startWorld = new THREE.Vector3();
   if (!pivotDragRaycaster.ray.intersectPlane(plane, startWorld)) return false;
-  const pivotSnapshot = captureBonePivotAction(bone);
+  const pivotSnapshot = captureBonePivotAction(bone, moveBoneSection ? [] : nearestDescendantBones(bone));
   activeBonePivotDrag = {
-    ...pivotSnapshot, bone, plane, pointerStartWorld: startWorld.clone(),
+    ...pivotSnapshot, section: moveBoneSection, bone, plane, pointerStartWorld: startWorld.clone(),
     pointerOffset: pivotSnapshot.startWorld.clone().sub(startWorld), moved: false,
   };
   controls.enabled = false;
@@ -584,13 +584,13 @@ function finishBonePivotDrag() {
   for (const skeleton of drag.skeletons) preserveBindTransforms(skeleton, drag.worlds.get(skeleton), drag.inverses.get(skeleton));
   updatePivotOffsets(drag.bone, drag.children);
   const end = drag.bone.getWorldPosition(new THREE.Vector3()).toArray();
-  const pivotEdit = { bone: drag.bone.name, method: 'manual_view_drag_camera_plane', start_world: drag.startWorld.toArray(), end_world: end, confidence: 'user_review' };
+  const pivotEdit = { bone: drag.bone.name, method: drag.section ? 'manual_section_drag' : 'manual_view_drag_camera_plane', start_world: drag.startWorld.toArray(), end_world: end, confidence: 'user_review' };
   drag.pivotEdit = pivotEdit;
   drag.kind = 'bone_pivot';
   drag.boneName = drag.bone.name;
   editHistory.record('bones', drag);
   bonePivotEdits.push(pivotEdit);
-  showStatus(avatarDisplayName, `Pivote ${drag.bone.name} movido sin desplazar sus articulaciones hijas. La pose neutral se conservó; puedes deshacer o guardar.`);
+  showStatus(avatarDisplayName, drag.section ? `Sección ${drag.bone.name} y todas sus articulaciones descendientes movidas. Puedes deshacer o guardar.` : `Pivote ${drag.bone.name} movido sin desplazar sus articulaciones hijas. La pose neutral se conservó; puedes deshacer o guardar.`);
   return true;
 }
 
@@ -638,6 +638,7 @@ const editHistory = createEditHistory({
 });
 let handPaintPointerDown = false;
 let handPaintStroke = null;
+let moveBoneSection = false;
 let selectedBoneName = '';
 let skeletonVisible = true;
 let manualPoseMode = false;
@@ -2496,6 +2497,7 @@ async function saveEditedModel() {
 
 window.meshingupAvatar = {
   loadModel,
+  setMoveBoneSection(enabled) { finishBonePivotDrag(); moveBoneSection = Boolean(enabled); },
   autoRig(forwardAxis) { return autoRig(forwardAxis).catch((error) => { showStatus(avatarDisplayName, `Error de auto-rig: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
   saveEditedModel() { return saveEditedModel().catch((error) => { showStatus(avatarDisplayName, `Error al guardar: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
   setPlan: applyPlan,

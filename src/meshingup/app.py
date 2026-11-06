@@ -2822,8 +2822,22 @@ class MainWindow(QMainWindow):
                 return
             if self.canvas.mask_image is None or self.canvas.mask_path is None:
                 raise ProjectError("No hay una máscara activa para guardar.")
-            self.canvas.mask_image.save(self.canvas.mask_path, format="PNG")
-            save_project(self.project_path, self._editor_project_data(), action=f"layer_mask_painted:{layer_id}", actor="user")
+            data = self._editor_project_data()
+            layer = next((item for item in data.get("layers", []) if item.get("id") == layer_id), None)
+            if layer is None:
+                raise ProjectError("La capa de la máscara ya no existe.")
+            old_path = self.canvas.mask_path
+            new_path = old_path.with_name(f"mask-{uuid.uuid4().hex}.png")
+            if not self.canvas.mask_image.save(str(new_path), "PNG"):
+                raise ProjectError("No pude escribir la máscara.")
+            layer["mask"] = new_path.relative_to(self.project_path.parent).as_posix()
+            try:
+                save_project(self.project_path, data, action=f"layer_mask_painted:{layer_id}", actor="user")
+            except Exception:
+                new_path.unlink(missing_ok=True)
+                layer["mask"] = str(old_path)
+                raise
+            self.canvas.mask_path = new_path
             self.loaded_mtime_ns = self.project_path.stat().st_mtime_ns
             self.canvas.composite_preview = None
             self.preview_button.setChecked(False)

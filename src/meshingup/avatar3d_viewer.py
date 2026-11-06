@@ -251,6 +251,9 @@ class Avatar3DDialog(QDialog):
         self.drag_bone_pivot.setToolTip("Activa el modo, selecciona un hueso y arrastra su punto amarillo. Sólo cambia ese pivote: las articulaciones hijas quedan ancladas. El arrastre ocurre en el plano de la vista; gira la cámara para ajustar otra profundidad. Se puede deshacer.")
         self.drag_bone_pivot.setEnabled(False)
         self.drag_bone_pivot.toggled.connect(self._configure_bone_pivot_drag)
+        self.move_bone_section = QCheckBox("Mover sección completa (incluir descendientes)")
+        self.move_bone_section.setToolTip("Selecciona la mano para mover muñeca y dedos juntos. Conserva la distancia entre sus articulaciones y la apariencia de la malla. Funciona con el ratón y los controles de posición; se puede deshacer.")
+        self.move_bone_section.toggled.connect(lambda enabled: self._run("window.meshingupAvatar?.setMoveBoneSection(" + json.dumps(enabled) + ");"))
         pivot_controls = QHBoxLayout()
         pivot_controls.addWidget(self.drag_bone_pivot)
         pivot_controls.addWidget(QLabel("Limitar a"))
@@ -447,6 +450,7 @@ class Avatar3DDialog(QDialog):
         pivot_group = group(
             "Pivotes",
             self.drag_bone_pivot,
+            self.move_bone_section,
             labelled("Limitar a", self.pivot_axis_combo),
             row(self.center_pivot_x, self.center_pivot_y),
             self.fit_hand_skeleton,

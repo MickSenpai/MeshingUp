@@ -134,6 +134,8 @@ meshingupctl export ~/MeshingUp/Projects/Meido.meshingup ~/MeshingUp/Exports/Mei
 meshingupctl decompose ~/MeshingUp/Projects/Meido.meshingup --allow-upload
 ```
 
+`meshingupctl validate` devuelve código 0 para `ready`, 1 para `needs_review` y 2 cuando encuentra errores (`failed`). El informe JSON incluye los motivos.
+
 Extrae cada pieza después de finalizar su máscara. Cuando todas las máscaras activas tienen una pieza actual, ejecuta el inpainting y abre **Ver composición reconstruida** para revisar el resultado. Esto rellena con píxeles vecinos; no sustituye una reconstrucción semántica. La validación detecta piezas ausentes o desactualizadas y no permite marcar `ready` mientras haya errores o advertencias.
 
 Para proponer máscaras desde `meshingupctl`, instala el extra `segmentation`. `--positive x y` y `--negative x y` se pueden repetir; `--box` recibe `x1 y1 x2 y2`. Las propuestas se guardan en el proyecto y deben aprobarse con `meshingupctl layer accept`.
@@ -188,3 +190,5 @@ Este proyecto se llamó antes de otra forma. Los proyectos, la biblioteca y las 
 - Los clips ya incluidos en GLB antiguos conservan el nombre con el que se generaron.
 
 Esa compatibilidad está en un solo sitio del código (`LEGACY_*` en `src/meshingup/project.py`) y se puede retirar cuando ya no haga falta.
+
+En el visor 3D, **Pivotes → Mover sección completa (incluir descendientes)** mueve el hueso seleccionado y toda su jerarquía. Para recolocar una mano, selecciona `leftHand` o `rightHand`, activa esta opción y arrastra el punto amarillo con **Mover pivote con ratón**, o utiliza los controles de posición. Los dedos conservan sus posiciones relativas. La edición conserva la apariencia neutral de la malla y admite deshacer/rehacer; usa **Guardar rig/pose editados** para conservar el resultado. Desactiva la opción para editar un pivote aislado.
