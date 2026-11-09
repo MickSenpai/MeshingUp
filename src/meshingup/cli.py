@@ -202,6 +202,17 @@ def _parser() -> argparse.ArgumentParser:
     avatar_auto.add_argument("--skip-repair", action="store_true", help="Riggea el GLB tal como está, sin repararlo.")
     avatar_auto.add_argument("--min-island-vertices", type=int, default=0)
     avatar_auto.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, detecta PATH o Flatpak.")
+    generate = avatar_sub.add_parser("generate", help="Genera un GLB desde la imagen del proyecto con TRELLIS remoto.")
+    generate.add_argument("project")
+    generate.add_argument("--allow-upload", action="store_true")
+    generate.add_argument("--prepare", action="store_true", help="Encadena reparación, rig y clips con Blender.")
+    generate.add_argument("--seed", type=int, default=0)
+    avatar_sub.add_parser("agent-contract", help="Contrato JSON de evaluación y edición para agentes.")
+    for operation in ("evaluate", "evidence", "edit", "review"):
+        agent = avatar_sub.add_parser(operation, help="Operación estructurada para agentes 3D: " + operation)
+        agent.add_argument("project")
+        if operation in {"edit", "review"}:
+            agent.add_argument("--request", required=True, help="Archivo JSON conforme a agent-contract.")
     avatar_parts = avatar_sub.add_parser("analyze-parts", help="Detecta islas extraíbles y propone regiones corporales en un GLB usando Blender.")
     avatar_parts.add_argument("project")
     avatar_parts.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
@@ -273,8 +284,12 @@ def main() -> None:
             _emit(ProjectLibrary().list_projects(), args.json)
         elif args.command == "create":
             path = create_project(args.image, args.output, args.name)
-            ProjectLibrary().add(path)
-            _emit({"created": str(path), "project": load_project(path)})
+            warnings = []
+            try:
+                ProjectLibrary().add(path)
+            except OSError:
+                warnings.append("El proyecto se creó, pero no se pudo registrar en la biblioteca. Ábrelo desde su archivo.")
+            _emit({"created": str(path), "project": load_project(path), "warnings": warnings})
         elif args.command == "inspect":
             project = load_project(args.project)
             _emit({key: value for key, value in project.items() if not key.startswith("_")})
@@ -367,6 +382,21 @@ def main() -> None:
             output.parent.mkdir(parents=True, exist_ok=True)
             image.save(output)
             _emit({"render": str(output), "frame": args.frame, "clip": args.clip, "expression": args.expression})
+        elif args.command == "avatar3d" and args.avatar_action == "agent-contract":
+            from .agent3d import contract
+            _emit(contract())
+        elif args.command == "avatar3d" and args.avatar_action in {"evaluate", "evidence", "edit", "review"}:
+            from .agent3d import operate
+            payload = None
+            if getattr(args, "request", None):
+                try:
+                    payload = json.loads(Path(args.request).read_text())
+                except (OSError, ValueError) as exc:
+                    raise ProjectError("No pude leer la solicitud JSON.") from exc
+            _emit(operate(args.project, args.avatar_action, payload))
+        elif args.command == "avatar3d" and args.avatar_action == "generate":
+            from .generation3d import generate_avatar
+            _emit(generate_avatar(args.project, allow_upload=args.allow_upload, prepare=args.prepare, seed=args.seed))
         elif args.command == "avatar3d" and args.avatar_action == "attach":
             result = attach_avatar(args.project, args.model, actor="agent")
             _emit(result)

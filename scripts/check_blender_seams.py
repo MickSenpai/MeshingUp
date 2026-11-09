@@ -11,6 +11,7 @@ for node in tree.body:
         exec(compile(ast.Module(body=[node],type_ignores=[]),source,'exec'))
 bpy.ops.object.select_all(action='SELECT'); bpy.ops.object.delete(use_global=False)
 height=2.0
+intentional_split_vertices = {}
 mesh=bpy.data.meshes.new('seam'); mesh.from_pydata([(0,0,0),(1,0,0),(0,1,0),(1,0,0),(0,1,0),(1,1,0)],[],[(0,1,2),(3,5,4)])
 obj=bpy.data.objects.new('seam',mesh); bpy.context.collection.objects.link(obj); meshes=[obj]
 arm=bpy.data.armatures.new('rig'); arm_obj=bpy.data.objects.new('rig',arm); bpy.context.collection.objects.link(arm_obj); bpy.context.view_layer.objects.active=arm_obj; arm_obj.select_set(True)

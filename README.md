@@ -192,3 +192,59 @@ Este proyecto se llamó antes de otra forma. Los proyectos, la biblioteca y las 
 Esa compatibilidad está en un solo sitio del código (`LEGACY_*` en `src/meshingup/project.py`) y se puede retirar cuando ya no haga falta.
 
 En el visor 3D, **Pivotes → Mover sección completa (incluir descendientes)** mueve el hueso seleccionado y toda su jerarquía. Para recolocar una mano, selecciona `leftHand` o `rightHand`, activa esta opción y arrastra el punto amarillo con **Mover pivote con ratón**, o utiliza los controles de posición. Los dedos conservan sus posiciones relativas. La edición conserva la apariencia neutral de la malla y admite deshacer/rehacer; usa **Guardar rig/pose editados** para conservar el resultado. Desactiva la opción para editar un pivote aislado.
+
+### Generación 3D desde imagen (experimental)
+
+Instala `python -m pip install -e '.[generation3d]'`. Crea un proyecto desde
+una imagen de cuerpo completo, preferiblemente con fondo transparente, y usa
+el menú 3D → **Crear 3D desde imagen · TRELLIS en nube…**. El diálogo solicita
+consentimiento para enviar la imagen a Hugging Face y permite encadenar Blender.
+No reemplaza avatares existentes: crea un proyecto nuevo para otra versión.
+
+CLI equivalente:
+
+```bash
+meshingupctl avatar3d generate personaje.meshingup --allow-upload --prepare
+```
+
+Sin `--prepare`, genera únicamente la malla. El adaptador utiliza
+[trellis-community/TRELLIS](https://huggingface.co/spaces/trellis-community/TRELLIS),
+requiere conexión y depende de su disponibilidad/cuota. Conserva la referencia,
+registra hash, proveedor y semilla, y deja el resultado en `needs_review`.
+Las superficies ocultas son inferidas. No incluye generación desde texto,
+retopología semántica, rig facial ni corrección autónoma de pesos defectuosos.
+Las pruebas locales simulan el proveedor; no certifican la generación remota.
+
+### Evaluación y modelado por agentes (Codex, Claude u otros)
+
+El menú 3D → **Evaluar avatar para agentes…** registra validación estructural y
+pendientes. No invoca un proveedor de IA ni declara una inspección visual ficticia.
+Un agente con acceso a la CLI y capacidad de ver imágenes puede seguir este ciclo:
+
+```bash
+meshingupctl avatar3d agent-contract
+meshingupctl avatar3d evaluate personaje.meshingup
+meshingupctl avatar3d evidence personaje.meshingup
+meshingupctl avatar3d edit personaje.meshingup --request cambios.json
+meshingupctl avatar3d evidence personaje.meshingup
+meshingupctl avatar3d review personaje.meshingup --request revision.json
+```
+
+`agent-contract` devuelve el formato JSON de solicitudes. `evidence` usa Blender
+local y guarda vistas frontal/posterior/lateral, nombres de mallas, huesos y
+`geometry.json` con índices, coordenadas locales y pesos. El agente debe abrir las
+imágenes antes de emitir un juicio visual. Las vistas actuales son de reposo;
+no sustituyen las pruebas de poses límite ni una revisión de animaciones.
+
+`edit` admite asignación normalizada de hasta cuatro pesos por vértice y traslación
+de vértices seleccionados en coordenadas locales Blender. No ejecuta código del
+agente. Requiere el hash exacto del GLB inspeccionado; los índices deben obtenerse
+nuevamente después de exportar. Conserva versiones previas en `agent3d.versions` y
+archivos originales, invalida diagnósticos del rig anterior y nunca marca `ready`.
+No admite edición de VRM ni desplazamiento de vértices con shape keys.
+
+`review` registra una declaración externa identificada por agente/modelo, hallazgos,
+veredicto y evidencia con hashes. No prueba por sí sola que una IA haya visto las
+imágenes ni convierte un `pass` visual en aprobación estructural. La integración
+no es todavía un bucle autónomo de corrección ni un servidor MCP: agentes con acceso
+a comandos pueden utilizarla sin automatizar la interfaz.

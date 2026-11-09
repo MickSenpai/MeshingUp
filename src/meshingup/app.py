@@ -165,6 +165,12 @@ class AvatarPrepareWorker(QThread):
 
     def run(self) -> None:
         try:
+            if getattr(self, "generate", False):
+                from .generation3d import generate_avatar
+                result = generate_avatar(self.project_path, allow_upload=True, prepare=self.prepare_generated,
+                                         expected_mtime_ns=self.expected_mtime_ns, actor="user", progress=self.progress.emit)
+                self.succeeded.emit(result)
+                return
             result = auto_prepare_avatar(
                 self.project_path, forward_axis=self.forward_axis, actor="user", expected_mtime_ns=self.expected_mtime_ns,
                 progress=self.progress.emit,
@@ -1098,6 +1104,12 @@ class MainWindow(QMainWindow):
         avatar_menu.addAction(self.avatar3d_attach_button)
         avatar_menu.addAction(self.avatar3d_viewer_button)
         avatar_menu.addSeparator()
+        self.avatar3d_generate_button = QAction("Crear 3D desde imagen · TRELLIS en nube…", self)
+        self.avatar3d_generate_button.triggered.connect(self._generate_avatar3d)
+        avatar_menu.addAction(self.avatar3d_generate_button)
+        self.avatar3d_evaluate_button = QAction("Evaluar avatar para agentes…", self)
+        self.avatar3d_evaluate_button.triggered.connect(self._evaluate_avatar3d_agent)
+        avatar_menu.addAction(self.avatar3d_evaluate_button)
         avatar_menu.addAction(self.avatar3d_prepare_button)
         steps_menu = avatar_menu.addMenu("Paso a paso")
         steps_menu.setToolTipsVisible(True)
@@ -1577,6 +1589,52 @@ class MainWindow(QMainWindow):
         self.avatar_repair_worker = None
         self._finish_job("repair")
         self._refresh_avatar_job_buttons()
+
+    def _evaluate_avatar3d_agent(self) -> None:
+        if self._avatar_jobs_busy() or not self._guard_external_changes("evaluar el avatar"):
+            return
+        from .agent3d import operate
+        try:
+            result = operate(self.project_path, "evaluate")
+        except (ProjectError, OSError) as exc:
+            QMessageBox.warning(self, "Evaluación", str(exc))
+            return
+        self._open_project_file(self.project_path)
+        validation = result["structural"]
+        lines = validation.get("errors", []) + validation.get("warnings", [])
+        QMessageBox.information(self, "Evaluación para agentes",
+            "Evaluación estructural registrada. Revisión visual pendiente.\n" + "\n".join(lines) +
+            "\nUn agente puede obtener imágenes y editar con meshingupctl avatar3d agent-contract.")
+
+    def _generate_avatar3d(self) -> None:
+        if self._avatar_jobs_busy() or not self._guard_external_changes("generar el avatar"):
+            return
+        data = load_project(self.project_path)
+        if data.get("avatar3d") or not data.get("image"):
+            QMessageBox.information(self, "Crear 3D", "Crea un proyecto nuevo desde una imagen, sin avatar 3D, para conservar tus modelos actuales.")
+            return
+        consent = QMessageBox.question(self, "Enviar imagen a TRELLIS",
+            "Se enviará la imagen del proyecto a trellis-community/TRELLIS en Hugging Face. "
+            "El servicio puede requerir cuota y genera superficies inferidas, incluida la espalda. "
+            "¿Autorizas este envío?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if consent != QMessageBox.StandardButton.Yes:
+            return
+        prepare = self.blender_available and QMessageBox.question(self, "Preparar animación",
+            "¿Añadir reparación, esqueleto, pesos y clips con Blender? El resultado requiere revisión visual.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+        worker = AvatarPrepareWorker(self.project_path, "-Y", self.loaded_mtime_ns)
+        worker.generate = True
+        worker.prepare_generated = prepare
+        self.avatar_prepare_worker = worker
+        self._set_avatar_job_buttons(False)
+        worker.succeeded.connect(self._avatar_prepare_succeeded)
+        worker.failed.connect(self._avatar_job_failed)
+        worker.finished.connect(self._avatar_prepare_finished)
+        worker.progress.connect(lambda percent, text: self._update_job("prepare", text, percent))
+        self._start_job("prepare", "Generando 3D con TRELLIS…", 5)
+        worker.start()
 
     def _prepare_avatar3d_full(self) -> None:
         if not self._guard_external_changes("preparar el avatar"):

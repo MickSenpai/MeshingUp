@@ -591,7 +591,7 @@ def animate_avatar3d(
 
 def _repair_lineage(avatar: dict[str, Any]) -> dict[str, Any]:
     """Metadata that must survive every re-attach so the untouched original stays traceable."""
-    return {key: avatar[key] for key in ("repair", "original_path", "original_sha256") if avatar.get(key)}
+    return {key: avatar[key] for key in ("repair", "original_path", "original_sha256", "generation") if avatar.get(key)}
 
 
 def _blender_command(launcher: list[str], script: Path, project_dir: Path, arguments: list[str]) -> list[str]:
@@ -846,6 +846,8 @@ def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> d
     rigging = avatar.get("rigging", {})
     deformation_validation = rigging.get("deformation_validation") if isinstance(rigging, dict) else None
     validation_warnings: list[str] = []
+    if avatar.get("agent_edited"):
+        validation_warnings.append("Avatar editado por agente: faltan nuevas pruebas de deformación y revisión visual.")
     if isinstance(deformation_validation, dict):
         if not deformation_validation.get("passed", False):
             validation_warnings.append("El rig no pasó la prueba automática de deformación; el proyecto requiere revisión y no debe marcarse como listo.")

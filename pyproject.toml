@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["PyQt6>=6.7,<6.12", "Pillow>=10.0"]
 
 [project.optional-dependencies]
+generation3d = ["gradio_client>=1.6"]
 inpaint = ["opencv-python-headless>=4.9"]
 segmentation = ["torch>=2.1", "torchvision>=0.16", "transformers>=4.57"]
 rigging = ["opencv-python-headless>=4.9"]

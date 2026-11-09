@@ -57,6 +57,7 @@ def island_sizes(bm):
         return index
 
     bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
     for edge in bm.edges:
         first, second = find(edge.verts[0].index), find(edge.verts[1].index)
         if first != second:
@@ -88,9 +89,17 @@ weld_distance = max(height * 5e-6, 1e-7)
 before, after, changes, warnings = {}, {}, {}, []
 for obj in meshes:
     before[obj.name] = measure(obj)
+    obj.data = obj.data.copy()
     had_custom_normals = obj.data.has_custom_normals
     bm = bmesh.new()
     bm.from_mesh(obj.data)
+    # Welding and area thresholds are measured in world units.
+    world_matrix = obj.matrix_world.copy()
+    try:
+        local_matrix = world_matrix.inverted()
+    except ValueError:
+        fail("La malla tiene una transformación singular: " + obj.name)
+    bm.transform(world_matrix)
     merged_before = len(bm.verts)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=weld_distance)
     welded = merged_before - len(bm.verts)
@@ -100,6 +109,7 @@ for obj in meshes:
     removed_islands = removed_island_vertices = 0
     if min_island_vertices:
         bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
         parent = list(range(len(bm.verts)))
 
         def find(index):
@@ -124,6 +134,7 @@ for obj in meshes:
     loose = [vertex for vertex in bm.verts if not vertex.link_faces]
     if loose:
         bmesh.ops.delete(bm, geom=loose, context="VERTS")
+    bm.transform(local_matrix)
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()

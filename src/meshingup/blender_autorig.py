@@ -63,8 +63,11 @@ del initial_points
 rotation = Matrix.Rotation(angle, 4, "Z")
 transform = Matrix.Translation(origin) @ rotation @ Matrix.Translation(-origin)
 if abs(angle) > 1e-6:
-    for obj in bpy.context.scene.objects:
-        obj.matrix_world = transform @ obj.matrix_world
+    # Transform roots only: descendants inherit the rotation from their parent.
+    roots = [(obj, obj.matrix_world.copy()) for obj in bpy.context.scene.objects if obj.parent is None]
+    for obj, world_matrix in roots:
+        obj.matrix_world = transform @ world_matrix
+    bpy.context.view_layer.update()
 forward_axis = "-Y"
 
 points = []
@@ -618,6 +621,10 @@ add_bone("neck", body_point(0, neck_z), body_point(0, head_z), "chest")
 add_bone("head", body_point(0, head_z), point_at(0, body_depth_at(head_z), top_z) if chibi_head_detected else body_point(0, top_z), "neck")
 
 for side_name, sign in (("left", 1), ("right", -1)):
+    hand_landmark_diagnostics[side_name] = {
+        "method": "proportional_fallback", "cross_section_samples": 0,
+        "elbow_samples": 0, "confidence": "low",
+    }
     shoulder = body_point(sign * shoulder_half, shoulder_z)
     outside, wrist_z = arm_extents[side_name]
     elbow_side = sign * (shoulder_half + (outside - shoulder_half) * 0.52)
@@ -1801,16 +1808,19 @@ def separate_hair_from_clothing():
         if not boundary:
             bm.free()
             continue
+        # Face identities survive splitting; vertex indices do not.
+        hair_faces = {face for face in bm.faces if is_hair(face)}
         original_count = len(bm.verts)
         on_cut = {vertex.index for edge in boundary for vertex in edge.verts}
         bmesh.ops.split_edges(bm, edges=boundary)
         bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
         deform = bm.verts.layers.deform.active
         hair_side, clothing_side = [], []
         for vertex in bm.verts:
             if (vertex.index not in on_cut and vertex.index < original_count) or not vertex.link_faces:
                 continue
-            kinds = {is_hair(face) for face in vertex.link_faces}
+            kinds = {face in hair_faces for face in vertex.link_faces}
             if kinds == {True}:
                 hair_side.append(vertex)
             elif kinds == {False}:
