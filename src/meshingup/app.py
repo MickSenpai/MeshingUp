@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import shutil
 import sys
@@ -52,7 +53,7 @@ from .project import (
 )
 from .rig import generate_layer_mesh, posed_joint_positions, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES
-from .avatar3d import analyze_avatar_parts, attach_avatar, auto_prepare_avatar, autorig_glb, blender_available, create_avatar_project, repair_avatar_mesh, validate_project_avatar
+from .avatar3d import analyze_avatar_parts, attach_avatar, auto_prepare_avatar, autorig_glb, blender_available, create_avatar_project, enhance_avatar3d, repair_avatar_mesh, validate_project_avatar
 from .avatar3d_viewer import Avatar3DDialog
 from .export import export_bundle
 from .decomposition import decompose_project_with_see_through
@@ -145,6 +146,25 @@ class AvatarRepairWorker(QThread):
     def run(self) -> None:
         try:
             result = repair_avatar_mesh(self.project_path, actor="user", expected_mtime_ns=self.expected_mtime_ns)
+        except (OSError, ProjectError) as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
+class AvatarEnhanceWorker(QThread):
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, project_path: Path, spec: dict[str, Any], expected_mtime_ns: int | None = None):
+        super().__init__()
+        self.project_path = project_path
+        self.spec = spec
+        self.expected_mtime_ns = expected_mtime_ns
+
+    def run(self) -> None:
+        try:
+            result = enhance_avatar3d(self.project_path, self.spec, actor="user", expected_mtime_ns=self.expected_mtime_ns)
         except (OSError, ProjectError) as exc:
             self.failed.emit(str(exc))
         else:
@@ -653,6 +673,7 @@ class MainWindow(QMainWindow):
         self.autorig_worker: AvatarAutoRigWorker | None = None
         self.avatar_parts_worker: AvatarPartsAnalysisWorker | None = None
         self.avatar_repair_worker: AvatarRepairWorker | None = None
+        self.avatar_enhance_worker: AvatarEnhanceWorker | None = None
         self.avatar_prepare_worker: AvatarPrepareWorker | None = None
         self.blender_available = blender_available()
         self.library = library or ProjectLibrary()
@@ -991,6 +1012,13 @@ class MainWindow(QMainWindow):
             "Suelda vértices duplicados por costuras y quita geometría muerta. El GLB original se conserva intacto; no rellena agujeros."
         )
         self.avatar3d_repair_button.triggered.connect(self._repair_avatar3d_mesh)
+        self.avatar3d_enhance_button = QAction("Añadir parpadeo, boca y pelo (JSON)…", self)
+        self.avatar3d_enhance_button.setEnabled(False)
+        self.avatar3d_enhance_button.setToolTip(
+            "Aplica una solicitud JSON de `meshingupctl avatar3d enhance`: morphs faciales (blink, aa…) y huesos secundarios "
+            "sobre el GLB riggeado. Es una reconstrucción: el GLB anterior se conserva y el proyecto vuelve a revisión."
+        )
+        self.avatar3d_enhance_button.triggered.connect(self._enhance_avatar3d)
         self.avatar3d_prepare_button = QAction("Preparar avatar completo (reparar → rig → animar)", self)
         self.avatar3d_prepare_button.setEnabled(False)
         self.avatar3d_prepare_button.setToolTip(
@@ -1116,6 +1144,7 @@ class MainWindow(QMainWindow):
         steps_menu.addAction(self.avatar3d_parts_button)
         steps_menu.addAction(self.avatar3d_repair_button)
         steps_menu.addAction(self.avatar3d_blender_button)
+        steps_menu.addAction(self.avatar3d_enhance_button)
         options_menu = avatar_menu.addMenu("Opciones")
         options_menu.setToolTipsVisible(True)
         front_menu = options_menu.addMenu("Frente del personaje")
@@ -1366,6 +1395,7 @@ class MainWindow(QMainWindow):
         self.avatar3d_repair_button.setEnabled(bool(
             self.blender_available and avatar.get("format") == "glb" and not avatar.get("rigged")
         ))
+        self.avatar3d_enhance_button.setEnabled(bool(self.blender_available and avatar.get("format") == "glb" and avatar.get("rigged")))
         self.avatar3d_blender_button.setText("Regenerar rig (Blender)" if avatar.get("rigged") else "Crear rig con Blender")
         self.avatar3d_blender_button.setToolTip(
             "Crea un rig nuevo desde el GLB original. Las correcciones del rig activo no se copian; el resultado pasa a ser el activo y se conservan hasta tres generaciones."
@@ -1538,10 +1568,11 @@ class MainWindow(QMainWindow):
     def _avatar_jobs_busy(self) -> bool:
         return any(worker is not None for worker in (
             self.autorig_worker, self.avatar_parts_worker, self.avatar_repair_worker, self.avatar_prepare_worker,
+            self.avatar_enhance_worker,
         ))
 
     def _set_avatar_job_buttons(self, enabled: bool) -> None:
-        for action in (self.avatar3d_repair_button, self.avatar3d_prepare_button, self.avatar3d_blender_button, self.avatar3d_parts_button):
+        for action in (self.avatar3d_repair_button, self.avatar3d_prepare_button, self.avatar3d_blender_button, self.avatar3d_parts_button, self.avatar3d_enhance_button):
             action.setEnabled(enabled and self.blender_available)
         # Importing another model while a job rewrites the project would collide with it.
         self.avatar3d_attach_button.setEnabled(enabled and self.project_path is not None)
@@ -1584,6 +1615,45 @@ class MainWindow(QMainWindow):
             lines.extend(["", *repair["warnings"]])
         self.avatar3d_info.setText("Malla reparada. Revisa el resultado antes de riggear.")
         QMessageBox.information(self, "Malla reparada", "\n".join(lines))
+
+    def _enhance_avatar3d(self) -> None:
+        if not self._guard_external_changes("mejorar el avatar"):
+            return
+        selected, _filter = QFileDialog.getOpenFileName(self, "Solicitud de mejora (JSON)", str(self.project_path.parent), "Solicitud JSON (*.json)")
+        if not selected:
+            return
+        try:
+            spec = json.loads(Path(selected).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Solicitud no válida", f"No pude leer el JSON: {exc}")
+            return
+        self._set_avatar_job_buttons(False)
+        self.status.setText("Blender está añadiendo morphs faciales y huesos secundarios; el GLB anterior se conserva…")
+        worker = AvatarEnhanceWorker(self.project_path, spec, expected_mtime_ns=self.loaded_mtime_ns)
+        self.avatar_enhance_worker = worker
+        worker.succeeded.connect(self._avatar_enhance_succeeded)
+        worker.failed.connect(self._avatar_job_failed)
+        worker.finished.connect(self._avatar_enhance_finished)
+        self._start_job("enhance", "Blender está mejorando el avatar…")
+        worker.start()
+
+    def _avatar_enhance_succeeded(self, result: dict[str, Any]) -> None:
+        self._open_project_file(self.project_path)
+        self.refresh_library()
+        report = result.get("enhancement", {})
+        lines = []
+        if report.get("face_morphs"):
+            lines.append("Morphs faciales: " + ", ".join(report["face_morphs"].get("targets", [])))
+        if report.get("secondary_bones"):
+            lines.append("Huesos secundarios: " + ", ".join(report["secondary_bones"].get("bones", [])))
+        lines.extend(["", *report.get("notes", []), "El GLB anterior sigue en el proyecto. Revisa el resultado en la vista 3D."])
+        self.avatar3d_info.setText("Avatar mejorado (reconstrucción). Requiere revisión.")
+        QMessageBox.information(self, "Avatar mejorado", "\n".join(lines))
+
+    def _avatar_enhance_finished(self) -> None:
+        self.avatar_enhance_worker = None
+        self._finish_job("enhance")
+        self._refresh_avatar_job_buttons()
 
     def _avatar_repair_finished(self) -> None:
         self.avatar_repair_worker = None
@@ -1692,6 +1762,7 @@ class MainWindow(QMainWindow):
         self.avatar3d_prepare_button.setEnabled(can_rig)
         self.avatar3d_parts_button.setEnabled(self.blender_available and avatar.get("format") == "glb")
         self.avatar3d_repair_button.setEnabled(bool(self.blender_available and avatar.get("format") == "glb" and not avatar.get("rigged")))
+        self.avatar3d_enhance_button.setEnabled(bool(self.blender_available and avatar.get("format") == "glb" and avatar.get("rigged")))
 
     def _analyze_avatar3d_parts(self) -> None:
         if self.project_path is None:

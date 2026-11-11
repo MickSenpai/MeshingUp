@@ -169,6 +169,10 @@ def inspect_glb(path: str | Path) -> dict[str, Any]:
         "invalid_skin_joints": invalid_skin_joints, "empty_skins": empty_skins,
         "human_bones": bone_names,
         "animations": [str(item.get("name") or f"Animation {i + 1}") for i, item in enumerate(animations) if isinstance(item, dict)],
+        "morph_targets": sorted({
+            str(name) for mesh in meshes
+            for name in ((mesh.get("extras") or {}).get("targetNames") or []) if isinstance(mesh.get("extras") or {}, dict)
+        }),
         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
     }
 
@@ -245,6 +249,7 @@ def attach_avatar(project_path: str | Path, model_path: str | Path, *, actor: st
         "sha256": info["sha256"], "name": info["name"],
         "rigged": info.get("rigged", True), "human_bones": info["human_bones"],
         "animations": info["animations"],
+        **({"morph_targets": info["morph_targets"]} if info.get("morph_targets") else {}),
         **(extra_metadata or {}),
     }
     paths_to_prune: list[dict[str, str]] = []
@@ -589,9 +594,188 @@ def animate_avatar3d(
     return {**attached, "animation": report}
 
 
+def _finite_numbers(value: Any, count: int) -> bool:
+    return (
+        isinstance(value, (list, tuple)) and len(value) == count
+        and all(type(item) in (int, float) and math.isfinite(item) for item in value)
+    )
+
+
+def validate_enhance_spec(spec: Any) -> dict[str, Any]:
+    """Check an ``avatar3d enhance`` request and return it with only known fields."""
+    if not isinstance(spec, dict) or not (spec.get("face") or spec.get("secondary_bones")):
+        raise ProjectError("La solicitud debe incluir `face`, `secondary_bones` o ambos.")
+    clean: dict[str, Any] = {}
+
+    def optional_number(source: dict[str, Any], key: str, low: float, high: float, target: dict[str, Any]) -> None:
+        if key in source:
+            value = source[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
+                raise ProjectError(f"`{key}` debe ser un número entre {low} y {high}.")
+            target[key] = value
+
+    def bone_name(value: Any, what: str) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,62}", value):
+            raise ProjectError(f"{what} debe ser un nombre de hueso (letras, números, `_`, `.` o `-`).")
+        return value
+
+    secondary = spec.get("secondary_bones")
+    if secondary:
+        if not isinstance(secondary, dict) or not isinstance(secondary.get("bones"), list) or not 1 <= len(secondary["bones"]) <= 16:
+            raise ProjectError("`secondary_bones.bones` requiere entre 1 y 16 huesos.")
+        item: dict[str, Any] = {"parent": bone_name(secondary.get("parent", "head"), "`secondary_bones.parent`"), "bones": []}
+        names: set[str] = set()
+        for bone in secondary["bones"]:
+            if not isinstance(bone, dict) or not _finite_numbers(bone.get("head"), 3) or not _finite_numbers(bone.get("tail"), 3):
+                raise ProjectError("Cada hueso secundario requiere name, head [x, y, z] y tail [x, y, z].")
+            name = bone_name(bone.get("name"), "El nombre de un hueso secundario")
+            if name in names or math.dist(bone["head"], bone["tail"]) < 1e-5:
+                raise ProjectError(f"El hueso secundario `{name}` está repetido o tiene longitud cero.")
+            names.add(name)
+            item["bones"].append({"name": name, "head": list(bone["head"]), "tail": list(bone["tail"])})
+        optional_number(secondary, "radius", 1e-4, 100, item)
+        optional_number(secondary, "max_weight", 0.05, 1, item)
+        optional_number(secondary, "min_parent_weight", 0, 1, item)
+        for key in ("smooth", "fill_passes"):
+            if key in secondary:
+                if type(secondary[key]) is not int or not 0 <= secondary[key] <= 40:
+                    raise ProjectError(f"`{key}` debe ser un entero entre 0 y 40.")
+                item[key] = secondary[key]
+        color = secondary.get("color_like")
+        if color is not None:
+            if not isinstance(color, dict) or not _finite_numbers(color.get("point"), 3):
+                raise ProjectError("`color_like` requiere point [x, y, z] sobre la región a seleccionar.")
+            item["color_like"] = {"point": list(color["point"])}
+            optional_number(color, "tolerance", 0.01, 1.5, item["color_like"])
+        clean["secondary_bones"] = item
+
+    face = spec.get("face")
+    if face:
+        if not isinstance(face, dict):
+            raise ProjectError("`face` debe ser un objeto.")
+        item = {"bone": bone_name(face.get("bone", "head"), "`face.bone`"), "eyes": []}
+        eyes = face.get("eyes", [])
+        if not isinstance(eyes, list) or len(eyes) > 4:
+            raise ProjectError("`face.eyes` admite hasta 4 ojos.")
+        for eye in eyes:
+            if (not isinstance(eye, dict) or not _finite_numbers(eye.get("center"), 2) or not _finite_numbers(eye.get("radius"), 2)
+                    or min(eye["radius"]) <= 0):
+                raise ProjectError("Cada ojo requiere center [x, z] y radius [ancho, alto] positivos.")
+            entry = {"name": str(eye.get("name", ""))[:40], "center": list(eye["center"]), "radius": list(eye["radius"])}
+            optional_number(eye, "angle", -90, 90, entry)
+            optional_number(eye, "roundness", 1.5, 8, entry)
+            optional_number(eye, "line_level", -0.9, 0.9, entry)
+            optional_number(eye, "line_sag", -0.8, 0.8, entry)
+            optional_number(eye, "line_thickness", 0.01, 0.4, entry)
+            item["eyes"].append(entry)
+        mouth = face.get("mouth")
+        if mouth is not None:
+            if (not isinstance(mouth, dict) or not _finite_numbers(mouth.get("center"), 2)
+                    or type(mouth.get("width")) not in (int, float) or not math.isfinite(mouth["width"]) or mouth["width"] <= 0):
+                raise ProjectError("`face.mouth` requiere center [x, z] y width positivo.")
+            item["mouth"] = {"center": list(mouth["center"]), "width": mouth["width"]}
+            optional_number(mouth, "angle", -90, 90, item["mouth"])
+        if not item["eyes"] and "mouth" not in item:
+            raise ProjectError("`face` requiere al menos un ojo o la boca.")
+        for key in ("skin_sample", "line_sample"):
+            if key in face:
+                if not _finite_numbers(face[key], 2):
+                    raise ProjectError(f"`face.{key}` debe ser un punto [x, z].")
+                item[key] = list(face[key])
+        clean["face"] = item
+    return clean
+
+
+def enhance_avatar3d(
+    project_path: str | Path,
+    spec: dict[str, Any],
+    *,
+    blender_path: str | None = None,
+    actor: str = "agent",
+    expected_mtime_ns: int | None = None,
+) -> dict[str, Any]:
+    """Add facial morph targets and/or secondary bones to the project's rigged GLB.
+
+    The result is a new GLB; the previous one stays in the project. Everything
+    added is recorded as a reconstruction with the hash of the avatar it was
+    built from, and the project goes back to ``needs_review``.
+    """
+    request = validate_enhance_spec(spec)
+    launcher = resolve_blender_launcher(blender_path)
+    if not launcher:
+        raise ProjectError("No encuentro Blender. Instálalo para usar `meshingupctl avatar3d enhance`, o indica su ejecutable con --blender.")
+    project_file = Path(project_path).expanduser().resolve()
+    starting_mtime_ns = project_file.stat().st_mtime_ns
+    if expected_mtime_ns is not None and starting_mtime_ns != expected_mtime_ns:
+        raise ProjectError("El proyecto cambió desde que se abrió; recárgalo antes de mejorar el avatar.")
+    data = load_project(project_file)
+    info = data.get("avatar3d", {})
+    if not isinstance(info, dict) or info.get("format") != "glb" or not info.get("rigged"):
+        raise ProjectError("Primero crea un rig en un GLB del proyecto.")
+    source = _project_relative_file(project_file, info.get("path", ""), "el GLB del avatar")
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != info.get("sha256"):
+        raise ProjectError("El GLB del avatar falta o cambió desde que se abrió el proyecto; recárgalo antes de mejorarlo.")
+    current = inspect_glb(source)
+    bones = set(current["human_bones"])
+    for section, key in (("secondary_bones", "parent"), ("face", "bone")):
+        if section in request and request[section][key] not in bones:
+            raise ProjectError(f"El GLB no contiene el hueso `{request[section][key]}`.")
+    if "secondary_bones" in request:
+        repeated = sorted(bones & {bone["name"] for bone in request["secondary_bones"]["bones"]})
+        if repeated:
+            raise ProjectError("El rig ya contiene estos huesos: " + ", ".join(repeated) + ".")
+    if "face" in request and current["morph_targets"]:
+        raise ProjectError("El avatar ya tiene morph targets (" + ", ".join(current["morph_targets"]) + "); no los duplico.")
+    script = Path(__file__).with_name("blender_enhance.py")
+    with tempfile.TemporaryDirectory(prefix=".meshingup-enhance-", dir=project_file.parent) as temporary_dir:
+        temporary = Path(temporary_dir)
+        output, report_path, request_path = temporary / "enhanced.glb", temporary / "enhance.json", temporary / "request.json"
+        request_path.write_text(json.dumps(request), encoding="utf-8")
+        command = _blender_command(launcher, script, project_file.parent, [str(source), str(output), str(report_path), str(request_path)])
+        try:
+            process = subprocess.run(command, capture_output=True, text=True, timeout=1800, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProjectError(f"No pude ejecutar la mejora en Blender: {exc}") from exc
+        if process.returncode != 0 or not output.is_file() or not report_path.is_file():
+            detail = (process.stderr or process.stdout or "Blender terminó sin generar el GLB.")[-3500:]
+            raise ProjectError("Falló la mejora en Blender. La versión anterior sigue intacta. Detalle: " + detail)
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectError(f"Blender generó el modelo, pero no pude leer su informe: {exc}") from exc
+        result = validate_glb(output)
+        missing_clips = sorted(set(current["animations"]) - set(result["animations"]))
+        missing_bones = sorted(bones - set(result["human_bones"]))
+        if result["errors"] or not result["rigged"] or missing_clips or missing_bones:
+            raise ProjectError("El GLB mejorado no es válido: " + " ".join(
+                result["errors"] or [f"faltan clips {missing_clips} o huesos {missing_bones}."]))
+        if project_file.stat().st_mtime_ns != starting_mtime_ns:
+            raise ProjectError("El proyecto cambió mientras Blender trabajaba. No guardé la mejora; recárgalo e inténtalo de nuevo.")
+        enhancements = [item for item in info.get("enhancements", []) if isinstance(item, dict)] if isinstance(info.get("enhancements"), list) else []
+        enhancements.append({
+            "built_from_path": info.get("path", ""), "built_from_sha256": info.get("sha256", ""),
+            "request": request, "report": report, "reconstruction": True,
+        })
+        attached = attach_avatar(project_file, output, actor=actor, action="avatar3d_enhanced", extra_metadata={
+            "name": info.get("name", source.stem),
+            "source_path": info.get("source_path", ""),
+            "source_sha256": info.get("source_sha256", ""),
+            "rigging": info.get("rigging", {}),
+            **_repair_lineage(info),
+            "enhancements": enhancements,
+        })
+    added = [name for name, present in (("morphs faciales", "face" in request), ("huesos secundarios", "secondary_bones" in request)) if present]
+    update_workflow(
+        project_file, "needs_review", "avatar3d_review",
+        "Avatar mejorado con " + " y ".join(added) + " (reconstrucción). Revisa parpadeo, boca y movimiento del pelo en evidencias y en el visor.",
+        100, f"avatar3d-enhance-{uuid.uuid4().hex[:8]}",
+    )
+    return {**attached, "avatar": load_project(project_file)["avatar3d"], "enhancement": report}
+
+
 def _repair_lineage(avatar: dict[str, Any]) -> dict[str, Any]:
     """Metadata that must survive every re-attach so the untouched original stays traceable."""
-    return {key: avatar[key] for key in ("repair", "original_path", "original_sha256", "generation") if avatar.get(key)}
+    return {key: avatar[key] for key in ("repair", "original_path", "original_sha256", "generation", "enhancements") if avatar.get(key)}
 
 
 def _blender_command(launcher: list[str], script: Path, project_dir: Path, arguments: list[str]) -> list[str]:
@@ -848,6 +1032,14 @@ def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> d
     validation_warnings: list[str] = []
     if avatar.get("agent_edited"):
         validation_warnings.append("Avatar editado por agente: faltan nuevas pruebas de deformación y revisión visual.")
+    if avatar.get("enhancements"):
+        agent_state = data.get("agent3d")
+        review = agent_state.get("review") if isinstance(agent_state, dict) else None
+        if not (isinstance(review, dict) and review.get("source_sha256") == avatar.get("sha256") and review.get("verdict") == "pass"):
+            validation_warnings.append(
+                "El avatar incluye reconstrucciones (morphs faciales o huesos secundarios) sin una revisión visual aprobada "
+                "para esta versión: genera evidencias con `avatar3d evidence` y regístrala con `avatar3d review`."
+            )
     if isinstance(deformation_validation, dict):
         if not deformation_validation.get("passed", False):
             validation_warnings.append("El rig no pasó la prueba automática de deformación; el proyecto requiere revisión y no debe marcarse como listo.")

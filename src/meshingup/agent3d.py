@@ -2,6 +2,7 @@
 import hashlib
 import json
 import math
+import re
 import subprocess
 import uuid
 from pathlib import Path
@@ -20,9 +21,47 @@ def contract():
             {'type': 'weights', 'mesh': 'exact mesh name', 'vertices': [0], 'weights': {'head': 1.0}},
             {'type': 'translate_vertices', 'mesh': 'exact mesh name', 'vertices': [0], 'delta': [0, 0, 0.01]}]},
         'coordinates': 'Blender mesh-local; vertex indices apply only to the exact source hash',
+        'evidence_schema': {'shots': [{'name': 'arms_up', 'view': '|'.join(EVIDENCE_VIEWS),
+            'pose': {'leftUpperArm': [0, -60, 0]}, 'morphs': {'blink': 1.0}, 'clip': {'name': 'Idle', 'frame': 12},
+            'center': [0, 0, 0], 'scale': 1.0}],
+            'notes': 'Optional. pose uses the same semantic armature XYZ degrees as avatar3d animate; clip and pose are exclusive; up to 24 shots are rendered after the three rest views.'},
+        'enhance': 'avatar3d enhance --spec adds facial morph targets (blink, aa, ih, ou, ee, oh) and secondary bones as labelled reconstructions.',
         'review_schema': {'source_sha256': 'current avatar hash', 'evidence_id': 'evidence directory id',
             'reviewer': 'agent/model name', 'verdict': 'pass|needs_changes', 'findings': ['concrete observations']},
         'limits': 'No automatic AI provider calls. External vision agent must inspect evidence; reviews never set ready.'}
+
+
+EVIDENCE_VIEWS = ('front', 'back', 'left', 'right', 'front_left', 'front_right', 'back_left', 'back_right')
+
+
+def validate_shots(shots):
+    def numbers(value, count):
+        return isinstance(value, list) and len(value) == count and all(type(v) in (int, float) and math.isfinite(v) for v in value)
+    if not isinstance(shots, list) or len(shots) > 24:
+        raise ProjectError('shots admite hasta 24 tomas.')
+    names = set()
+    for shot in shots:
+        if not isinstance(shot, dict) or not isinstance(shot.get('name'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', shot['name']):
+            raise ProjectError('Cada toma requiere name con letras, números, guion o guion bajo.')
+        if shot['name'] in names or shot['name'] in {'front', 'back', 'side'}:
+            raise ProjectError('Nombre de toma repetido o reservado: ' + shot['name'])
+        names.add(shot['name'])
+        if shot.get('view', 'front') not in EVIDENCE_VIEWS:
+            raise ProjectError('view debe ser una de: ' + ', '.join(EVIDENCE_VIEWS))
+        pose = shot.get('pose', {})
+        if not isinstance(pose, dict) or any(not isinstance(k, str) or not numbers(v, 3) or max(map(abs, v)) > 360 for k, v in pose.items()):
+            raise ProjectError('pose requiere {hueso: [x, y, z]} en grados dentro de ±360.')
+        morphs = shot.get('morphs', {})
+        if not isinstance(morphs, dict) or any(not isinstance(k, str) or type(v) not in (int, float) or not 0 <= v <= 1 for k, v in morphs.items()):
+            raise ProjectError('morphs requiere {nombre: valor entre 0 y 1}.')
+        clip = shot.get('clip')
+        if clip is not None and (not isinstance(clip, dict) or not isinstance(clip.get('name'), str) or type(clip.get('frame')) is not int
+                                 or not 0 <= clip['frame'] <= 100000 or pose):
+            raise ProjectError('clip requiere name y frame entero, y no se combina con pose.')
+        if 'center' in shot and not numbers(shot['center'], 3):
+            raise ProjectError('center requiere tres números.')
+        if 'scale' in shot and (type(shot['scale']) not in (int, float) or not math.isfinite(shot['scale']) or shot['scale'] <= 0):
+            raise ProjectError('scale debe ser positivo.')
 
 
 def validate_changes(changes):
@@ -87,6 +126,8 @@ def operate(project, operation, payload=None):
         if operation == 'edit':
             changes = payload.get('changes')
             validate_changes(changes)
+        else:
+            validate_shots(payload.get('shots', []))
         launcher = resolve_blender_launcher()
         if not launcher: raise ProjectError('Instala Blender para esta operación.')
         root = path.parent / 'assets' / 'agent3d' / task; root.mkdir(parents=True)

@@ -6,6 +6,7 @@ import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
 import './style.css';
 import { preserveBindTransforms } from './hand_rig.js';
 import { createEditHistory } from './edit_history.js';
+import { createSecondaryMotion } from './secondary_motion.js';
 
 const canvas = document.querySelector('#avatar');
 const nameLabel = document.querySelector('#model-name');
@@ -642,6 +643,8 @@ let moveBoneSection = false;
 let selectedBoneName = '';
 let skeletonVisible = true;
 let manualPoseMode = false;
+const secondaryMotion = createSecondaryMotion();
+let secondaryMotionEnabled = true;
 let operationBusy = false;
 const boneRestQuaternions = new Map();
 const boneRestPositions = new Map();
@@ -789,6 +792,8 @@ function refreshBoneData() {
     for (const skeleton of skeletons) boneRestInverses.set(skeleton, skeleton.boneInverses.map((matrix) => matrix.clone()));
   }
   autoRigBones = detectedBones;
+  // VRM models bring their own spring bones; only plain GLB rigs use this one.
+  secondaryMotion.bind(vrm ? [] : detectedBones, (bone) => boneRestQuaternions.get(bone));
   if (skeletonHelper) scene.remove(skeletonHelper);
   skeletonHelper = avatarRoot ? new THREE.SkeletonHelper(avatarRoot) : null;
   if (skeletonHelper) {
@@ -2125,6 +2130,11 @@ function animate(now) {
     }
     setExpression('blink', blink);
     applySpeechPose();
+    // Hair and other secondary bones follow with inertia, except while a pose is being edited by hand.
+    if (secondaryMotion.count) {
+      if (secondaryMotionEnabled && !manualPoseMode) secondaryMotion.update(dt);
+      else if (!manualPoseMode) secondaryMotion.reset();
+    }
     vrm?.update(dt);
     if (handDiagnosticGroup?.visible) {
       avatarRoot.updateMatrixWorld(true);
@@ -2485,6 +2495,8 @@ async function saveEditedModel() {
   if (operationBusy) throw new Error('Ya hay una operación 3D en curso.');
   operationBusy = true;
   try {
+  // Never bake a momentary hair swing into the saved rest pose.
+  if (!manualPoseMode) secondaryMotion.reset();
   const report = { method: 'meshingup_threejs_pose_edit', bones: autoRigBones.length, confidence: 'user_review',
     region_weight_mappings: handMappingReports,
     bone_pivot_edits: bonePivotEdits,
@@ -2502,6 +2514,19 @@ window.meshingupAvatar = {
   saveEditedModel() { return saveEditedModel().catch((error) => { showStatus(avatarDisplayName, `Error al guardar: ${error.message}`); if (hostBridge) callHost('reportFailure', error.message).catch(() => {}); throw error; }); },
   setPlan: applyPlan,
   playClip(name, options = {}) { return playClipByName(name, options.loop !== false); },
+  setSecondaryMotion(enabled) { secondaryMotionEnabled = Boolean(enabled); if (!secondaryMotionEnabled && !manualPoseMode) secondaryMotion.reset(); return { enabled: secondaryMotionEnabled, bones: secondaryMotion.names() }; },
+  // Read-only numbers for automated checks: current blink influence and the largest secondary-bone swing (radians).
+  debugProbe() {
+    let blink = 0; let hairAngle = 0;
+    avatarRoot?.traverse((node) => {
+      const index = node.morphTargetDictionary?.blink;
+      if (index !== undefined && node.morphTargetInfluences) blink = Math.max(blink, node.morphTargetInfluences[index]);
+      if (node.isBone && secondaryMotion.names().includes(node.name)) hairAngle = Math.max(hairAngle, node.quaternion.angleTo(boneRestQuaternions.get(node) || node.quaternion));
+    });
+    return { blink, hairAngle };
+  },
+  getSecondaryMotion() { return { enabled: secondaryMotionEnabled, bones: secondaryMotion.names() }; },
+  getMorphTargets() { const names = new Set(); avatarRoot?.traverse((mesh) => { for (const key of Object.keys(mesh.morphTargetDictionary || {})) names.add(key); }); return [...names].sort(); },
   setSkeletonVisible(visible) { skeletonVisible = Boolean(visible); if (skeletonHelper) skeletonHelper.visible = skeletonVisible; },
   setHandDiagnostics,
   setJointDiagnostics: setHandDiagnostics,

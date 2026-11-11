@@ -36,7 +36,7 @@ from .export import export_bundle
 from .rig import generate_layer_mesh, render_project_pose, sample_clip, sample_layer_visibility, set_vertex_weight, solve_two_bone_ik
 from .decomposition import decompose_project_with_see_through
 from .behavior import BehaviorRuntime, BEHAVIOR_STATES, motion_event_from_agent
-from .avatar3d import ANIMATION_PRESETS, analyze_avatar_parts, animate_avatar3d, attach_avatar, auto_prepare_avatar, autorig_glb, repair_avatar_mesh, validate_project_avatar, validate_glb, validate_vrm
+from .avatar3d import ANIMATION_PRESETS, analyze_avatar_parts, create_avatar_project, animate_avatar3d, enhance_avatar3d, attach_avatar, auto_prepare_avatar, autorig_glb, repair_avatar_mesh, validate_project_avatar, validate_glb, validate_vrm
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -213,6 +213,16 @@ def _parser() -> argparse.ArgumentParser:
         agent.add_argument("project")
         if operation in {"edit", "review"}:
             agent.add_argument("--request", required=True, help="Archivo JSON conforme a agent-contract.")
+        elif operation == "evidence":
+            agent.add_argument("--request", help="Archivo JSON opcional con `shots` (poses, morphs o fotogramas de clips); ver agent-contract.")
+    avatar_create = avatar_sub.add_parser("create", help="Crea un proyecto 3D-only (sin imagen 2D) desde un GLB/VRM.")
+    avatar_create.add_argument("model")
+    avatar_create.add_argument("project", help="Ruta del nuevo archivo .meshingup; no sobrescribe uno existente.")
+    avatar_create.add_argument("--name")
+    avatar_enhance = avatar_sub.add_parser("enhance", help="Añade morphs faciales (parpadeo, boca) y huesos secundarios (pelo) al GLB riggeado con Blender; quedan registrados como reconstrucción.")
+    avatar_enhance.add_argument("project")
+    avatar_enhance.add_argument("--spec", required=True, help="Archivo JSON con `face` y/o `secondary_bones` en coordenadas Blender del modelo.")
+    avatar_enhance.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, detecta PATH o Flatpak.")
     avatar_parts = avatar_sub.add_parser("analyze-parts", help="Detecta islas extraíbles y propone regiones corporales en un GLB usando Blender.")
     avatar_parts.add_argument("project")
     avatar_parts.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, lo busca en PATH.")
@@ -222,7 +232,8 @@ def _parser() -> argparse.ArgumentParser:
     avatar_animate.add_argument("name")
     avatar_animate.add_argument("--duration", type=int, required=True, help="Duración del clip en fotogramas.")
     avatar_animate.add_argument("--fps", type=int, default=30)
-    avatar_animate.add_argument("--keyframe", nargs=5, action="append", required=True, metavar=("FRAME", "BONE", "RX", "RY", "RZ"), help="Clave de rotación semántica XYZ del rig en grados; se puede repetir.")
+    avatar_animate.add_argument("--keyframe", nargs=5, action="append", default=[], metavar=("FRAME", "BONE", "RX", "RY", "RZ"), help="Clave de rotación semántica XYZ del rig en grados; se puede repetir.")
+    avatar_animate.add_argument("--keyframes-file", help="Archivo JSON con una lista de claves {frame, bone, rotation: [x, y, z]}; se suma a --keyframe.")
     avatar_animate.add_argument("--blender", help="Ruta al ejecutable Blender; si se omite, detecta PATH o Flatpak.")
     avatar_inspect = avatar_sub.add_parser("inspect", help="Muestra metadatos y capacidades del avatar registrado.")
     avatar_inspect.add_argument("project")
@@ -403,6 +414,14 @@ def main() -> None:
         elif args.command == "avatar3d" and args.avatar_action == "autorig":
             result = autorig_glb(args.project, blender_path=args.blender, forward_axis=args.forward_axis, actor="agent")
             _emit(result)
+        elif args.command == "avatar3d" and args.avatar_action == "create":
+            _emit(create_avatar_project(args.model, args.project, name=args.name, actor="agent"))
+        elif args.command == "avatar3d" and args.avatar_action == "enhance":
+            try:
+                spec = json.loads(Path(args.spec).expanduser().read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ProjectError("No pude leer la solicitud JSON de mejora.") from exc
+            _emit(enhance_avatar3d(args.project, spec, blender_path=args.blender, actor="agent"))
         elif args.command == "avatar3d" and args.avatar_action == "repair":
             _emit(repair_avatar_mesh(args.project, blender_path=args.blender, min_island_vertices=args.min_island_vertices, actor="agent"))
         elif args.command == "avatar3d" and args.avatar_action == "auto":
@@ -422,6 +441,14 @@ def main() -> None:
                 ]
             except ValueError as exc:
                 raise ProjectError("Cada --keyframe requiere frame entero y tres rotaciones numéricas.") from exc
+            if args.keyframes_file:
+                try:
+                    extra = json.loads(Path(args.keyframes_file).expanduser().read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise ProjectError("No pude leer el archivo JSON de claves.") from exc
+                if not isinstance(extra, list):
+                    raise ProjectError("El archivo de claves debe contener una lista.")
+                keyframes.extend(extra)
             result = animate_avatar3d(
                 args.project, args.name, args.duration, args.fps, keyframes,
                 blender_path=args.blender, actor="agent",
