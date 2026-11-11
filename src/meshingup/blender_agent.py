@@ -70,4 +70,45 @@ else:
         camera.rotation_euler=(center-camera.location).to_track_quat('-Z','Y').to_euler()
         scene.render.filepath=str(root/(name+'.png')); bpy.ops.render.render(write_still=True)
         report['evidence'].append(name+'.png')
+    # Optional posed shots: semantic bone rotations, morph target values or a clip frame.
+    from mathutils import Euler
+    views = {'front':(0,-1,0),'back':(0,1,0),'left':(1,0,0),'right':(-1,0,0),'front_left':(.7,-.7,.25),
+             'front_right':(-.7,-.7,.25),'back_left':(.7,.7,.25),'back_right':(-.7,.7,.25)}
+    morph_names = sorted({k.name for o in meshes if o.data.shape_keys for k in o.data.shape_keys.key_blocks[1:]})
+    report['morph_targets'] = morph_names
+    report['animations'] = sorted(a.name for a in bpy.data.actions)
+    report['shots'] = []
+    for shot in request.get('shots', []):
+        unknown = [b for b in shot.get('pose', {}) if not any(b in rig.pose.bones for rig in rigs)]
+        unknown += [m for m in shot.get('morphs', {}) if m not in morph_names]
+        clip = shot.get('clip')
+        if clip and clip['name'] not in bpy.data.actions: unknown.append(clip['name'])
+        if unknown: raise ValueError('Unknown bone, morph or clip: ' + ', '.join(unknown))
+        for rig in rigs:
+            data = rig.animation_data or rig.animation_data_create()
+            for track in data.nla_tracks: track.mute = True
+            data.action = bpy.data.actions[clip['name']] if clip else None
+            if clip and hasattr(data, 'action_slot') and data.action_slot is None and data.action.slots:
+                data.action_slot = data.action.slots[0]
+            for bone in rig.pose.bones:
+                bone.matrix_basis.identity()
+        scene.frame_set(clip['frame'] if clip else 0)
+        for rig in rigs:
+            for name, degrees in shot.get('pose', {}).items():
+                bone = rig.pose.bones.get(name)
+                if bone is None: continue
+                rest = bone.bone.matrix_local.to_quaternion()
+                bone.rotation_mode = 'QUATERNION'
+                bone.rotation_quaternion = rest.inverted() @ Euler([math.radians(v) for v in degrees], 'XYZ').to_quaternion() @ rest
+        for obj in meshes:
+            if obj.data.shape_keys:
+                for key in obj.data.shape_keys.key_blocks[1:]: key.value = shot.get('morphs', {}).get(key.name, 0)
+        bpy.context.view_layer.update()
+        target = Vector(shot['center']) if 'center' in shot else center
+        camera.data.ortho_scale = shot.get('scale', size*1.25)
+        camera.location = target + Vector(views[shot.get('view', 'front')]).normalized()*size*3
+        camera.rotation_euler = (target-camera.location).to_track_quat('-Z','Y').to_euler()
+        scene.render.filepath = str(root/(shot['name']+'.png')); bpy.ops.render.render(write_still=True)
+        report['evidence'].append(shot['name']+'.png')
+        report['shots'].append({k: shot[k] for k in ('name','view','pose','morphs','clip') if k in shot})
 (root/'report.json').write_text(json.dumps(report))

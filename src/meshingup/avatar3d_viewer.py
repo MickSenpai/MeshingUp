@@ -169,6 +169,11 @@ class Avatar3DDialog(QDialog):
         self.skeleton_button.setEnabled(False)
         self.skeleton_button.toggled.connect(self._toggle_skeleton)
         action_controls.addWidget(self.skeleton_button)
+        self.secondary_motion = QCheckBox("Pelo con inercia")
+        self.secondary_motion.setChecked(True)
+        self.secondary_motion.setToolTip("Los huesos secundarios (hair…, tail…, ribbon…) siguen a la cabeza con inercia en el visor. No modifica el rig ni los clips guardados.")
+        self.secondary_motion.toggled.connect(self._toggle_secondary_motion)
+        action_controls.addWidget(self.secondary_motion)
 
         bone_controls = QHBoxLayout()
         bone_controls.addWidget(QLabel("Hueso"))
@@ -436,7 +441,7 @@ class Avatar3DDialog(QDialog):
             labelled("Clip GLB", self.clip_combo, self.play_clip_button),
             labelled("Intensidad", self.intensity_slider),
         )
-        view_widgets = ([self.autorig_button] if self.autorig_button else []) + [self.skeleton_button, self.hand_diagnostics]
+        view_widgets = ([self.autorig_button] if self.autorig_button else []) + [self.skeleton_button, self.secondary_motion, self.hand_diagnostics]
         view_group = group("Vista", *view_widgets)
         bone_group = group(
             "Hueso seleccionado",
@@ -750,6 +755,9 @@ class Avatar3DDialog(QDialog):
     def _toggle_skeleton(self, visible: bool) -> None:
         self.skeleton_button.setText("Ocultar esqueleto" if visible else "Mostrar esqueleto")
         self._run("window.meshingupAvatar?.setSkeletonVisible(" + ("true" if visible else "false") + ");")
+
+    def _toggle_secondary_motion(self, enabled: bool) -> None:
+        self._run("window.meshingupAvatar?.setSecondaryMotion(" + ("true" if enabled else "false") + ");")
 
     def _toggle_hand_diagnostics(self, visible: bool) -> None:
         self._run("window.meshingupAvatar?.setHandDiagnostics(" + ("true" if visible else "false") + ");")

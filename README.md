@@ -176,6 +176,32 @@ En el menú **Avatar 3D** hay dos botones más: **Reparar malla (Blender)** y **
 
 En el visor 3D, **Deshacer** y **Rehacer** (cabecera, junto a «Alinear vista»; Ctrl+Z / Ctrl+Shift+Z) recorren en orden las ediciones de pesos y de pivotes. Para probar su lógica: `node viewer3d/check_edit_history.mjs`.
 
+### Parpadeo, boca y pelo en un GLB riggeado
+
+`meshingupctl avatar3d enhance PROYECTO --spec mejora.json` (menú **Avatar 3D → Paso a paso → Añadir parpadeo, boca y pelo (JSON)…**) añade con Blender, sobre el GLB riggeado:
+
+- **Morphs faciales** `blink`, `aa`, `ih`, `ou`, `ee`, `oh` para caras pintadas en la textura: párpados y boca son parches pequeños ajustados a la superficie de la cara (por debajo del flequillo), sin área en reposo. El visor ya parpadea y aplica visemas con esos nombres.
+- **Huesos secundarios** (pelo, colas, lazos): hijos de un hueso existente que se reparten los pesos que ese hueso ya tenía, con una rampa a lo largo de cada hueso. El visor mueve con inercia los huesos cuyo nombre empieza por `hair`, `tail`, `ribbon`, `skirt`, `cape`, `scarf`, `ear`, `ahoge`, `ponytail`, `pigtail` o `braid` (casilla **Pelo con inercia**); no modifica el rig ni los clips.
+
+```json
+{
+  "secondary_bones": {
+    "parent": "head", "radius": 0.2, "smooth": 6,
+    "color_like": {"point": [0.04, 0.36, 0.3], "tolerance": 0.2},
+    "bones": [{"name": "hairBack", "head": [0.04, 0.3, 0.42], "tail": [0.04, 0.3, 0.14]}]
+  },
+  "face": {
+    "bone": "head",
+    "eyes": [{"name": "left", "center": [0.15, 0.44], "radius": [0.078, 0.064]}],
+    "mouth": {"center": [0.0245, 0.3145], "width": 0.075, "angle": 6}
+  }
+}
+```
+
+Las coordenadas son las de Blender tras importar el GLB (X lateral, Y profundidad con la cara mirando a −Y, Z arriba), las mismas de `geometry.json`; `center` de ojos y boca es `[x, z]` en la vista frontal. Todo lo añadido es **reconstrucción**, no geometría observada: queda registrado en `avatar3d.enhancements` con la solicitud, el informe y el hash del GLB de origen, el GLB anterior se conserva, el proyecto vuelve a `needs_review` y la validación impide `ready` hasta registrar una revisión `pass` de esa versión. No crea dedos ni separa el pelo de los hombros.
+
+`meshingupctl avatar3d create MODELO.glb PROYECTO.meshingup` crea un proyecto 3D-only sin pasar por la interfaz. `avatar3d animate` acepta además `--keyframes-file claves.json` (lista de `{frame, bone, rotation}`), y `avatar3d evidence --request tomas.json` renderiza, además de las tres vistas de reposo, hasta 24 tomas con poses (`pose`), morphs (`morphs`) o fotogramas de clips (`clip`); el esquema está en `avatar3d agent-contract`.
+
 La CLI equivalente al botón de Blender es `meshingupctl avatar3d autorig PROYECTO`. Para que un agente genere un clip 3D, `meshingupctl avatar3d animate PROYECTO NOMBRE --duration 48 --fps 24` acepta claves repetidas `--keyframe FOTOGRAMA HUESO RX RY RZ`; esos ángulos XYZ se interpretan en los ejes semánticos normalizados del rig y se convierten a los ejes locales de cada hueso. Los clips anteriores conservan su duración en segundos al agregar clips con otra frecuencia; el visor permite seleccionar y reproducir clips por nombre. Por ejemplo, el agente puede dar claves para `leftUpperArm` en los fotogramas 0, 12, 24 y 48 para un saludo, previsualizarlo y ajustar sus ángulos. Las animaciones de habla usan señales de visemas/energía que debe enviar la integración TTS; MeshingUp aún no genera fonemas desde texto ni se conecta en vivo con Meido.
 
 MeshingUp ya permite construir y revisar manualmente un rig deformable y animarlo; la automatización integral desde una sola imagen sigue siendo una etapa futura. La [investigación de rigging 2D](docs/INVESTIGACION_RIG_2D.md) recoge los criterios de calidad.
