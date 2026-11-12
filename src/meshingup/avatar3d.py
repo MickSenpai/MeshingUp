@@ -531,14 +531,29 @@ def animate_avatar3d(
         raise ProjectError("La ruta del GLB sale de la carpeta del proyecto.") from exc
     if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != info.get("sha256"):
         raise ProjectError("El GLB del avatar falta o cambió desde que se abrió el proyecto; recárgalo antes de animar.")
-    bone_names = set(inspect_glb(source)["human_bones"])
+    inspected = inspect_glb(source)
+    bone_names = set(inspected["human_bones"])
+    morph_names = set(inspected.get("morph_targets", []))
     seen_keys: set[tuple[int, str]] = set()
     for key in keyframes:
         if not isinstance(key, dict):
-            raise ProjectError("Cada clave debe ser un objeto con frame, bone y rotation.")
+            raise ProjectError("Cada clave debe ser un objeto con frame y bone + rotation, o frame y morph + value.")
         frame, bone, rotation = key.get("frame"), str(key.get("bone", "")), key.get("rotation")
-        if not isinstance(frame, int) or frame < 0 or frame > duration:
-            raise ProjectError(f"El fotograma de {bone or 'una clave'} debe estar entre 0 y {duration}.")
+        if type(frame) is not int or frame < 0 or frame > duration:
+            raise ProjectError(f"El fotograma de {bone or key.get('morph') or 'una clave'} debe estar entre 0 y {duration}.")
+        if "morph" in key:
+            morph, value = key.get("morph"), key.get("value")
+            if "bone" in key or "rotation" in key:
+                raise ProjectError("Una clave anima un hueso (bone + rotation) o un morph (morph + value), no ambos.")
+            if not isinstance(morph, str) or morph not in morph_names:
+                raise ProjectError(f"El GLB no contiene el morph `{morph}`." + (" Morphs disponibles: " + ", ".join(sorted(morph_names)) + "." if morph_names else ""))
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ProjectError(f"El valor del morph `{morph}` debe estar entre 0 y 1.")
+            if (frame, "morph:" + morph) in seen_keys:
+                raise ProjectError(f"Hay más de una clave para el morph `{morph}` en el fotograma {frame}.")
+            seen_keys.add((frame, "morph:" + morph))
+            normalized_keys.append({"frame": frame, "morph": morph, "value": float(value)})
+            continue
         if bone not in bone_names:
             raise ProjectError(f"El GLB no contiene el hueso `{bone}`.")
         identity = (frame, bone)
@@ -554,7 +569,7 @@ def animate_avatar3d(
         if not all(math.isfinite(value) and abs(value) <= 3600 for value in angles):
             raise ProjectError(f"Los ángulos de `{bone}` deben ser finitos y estar dentro de ±3600 grados.")
         normalized_keys.append({"frame": frame, "bone": bone, "rotation": angles})
-    if clip_name in inspect_glb(source)["animations"]:
+    if clip_name in inspected["animations"]:
         raise ProjectError(f"Ya existe una animación llamada `{clip_name}`. Elige otro nombre para conservar la anterior.")
     script = Path(__file__).with_name("blender_animate.py")
     with tempfile.TemporaryDirectory(prefix=".meshingup-animation-", dir=project_file.parent) as temporary_dir:
@@ -578,8 +593,9 @@ def animate_avatar3d(
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError(f"Blender generó el modelo, pero no pude leer el informe de animación: {exc}") from exc
         result = validate_glb(output)
-        if result["errors"] or clip_name not in result["animations"]:
-            raise ProjectError("El GLB exportado no contiene la animación solicitada: " + "; ".join(result["errors"]))
+        lost = sorted((set(inspected["animations"]) - set(result["animations"])) | (morph_names - set(result.get("morph_targets", []))))
+        if result["errors"] or clip_name not in result["animations"] or lost:
+            raise ProjectError("El GLB exportado no contiene la animación solicitada o perdió datos previos: " + "; ".join([*result["errors"], *lost]))
         if project_file.stat().st_mtime_ns != starting_mtime_ns:
             raise ProjectError("El proyecto cambió mientras Blender trabajaba. No guardé la animación; recárgalo e inténtalo de nuevo.")
         rigging = dict(info.get("rigging", {}))
@@ -603,8 +619,8 @@ def _finite_numbers(value: Any, count: int) -> bool:
 
 def validate_enhance_spec(spec: Any) -> dict[str, Any]:
     """Check an ``avatar3d enhance`` request and return it with only known fields."""
-    if not isinstance(spec, dict) or not (spec.get("face") or spec.get("secondary_bones")):
-        raise ProjectError("La solicitud debe incluir `face`, `secondary_bones` o ambos.")
+    if not isinstance(spec, dict) or not (spec.get("face") or spec.get("secondary_bones") or spec.get("hands")):
+        raise ProjectError("La solicitud debe incluir `face`, `secondary_bones` o `hands`.")
     clean: dict[str, Any] = {}
 
     def optional_number(source: dict[str, Any], key: str, low: float, high: float, target: dict[str, Any]) -> None:
@@ -667,6 +683,12 @@ def validate_enhance_spec(spec: Any) -> dict[str, Any]:
             optional_number(eye, "line_level", -0.9, 0.9, entry)
             optional_number(eye, "line_sag", -0.8, 0.8, entry)
             optional_number(eye, "line_thickness", 0.01, 0.4, entry)
+            optional_number(eye, "search", 1.2, 3, entry)
+            optional_number(eye, "tolerance", 0.02, 1, entry)
+            if "grow" in eye:
+                if type(eye["grow"]) is not int or not 0 <= eye["grow"] <= 8:
+                    raise ProjectError("`grow` debe ser un entero entre 0 y 8.")
+                entry["grow"] = eye["grow"]
             item["eyes"].append(entry)
         mouth = face.get("mouth")
         if mouth is not None:
@@ -675,15 +697,71 @@ def validate_enhance_spec(spec: Any) -> dict[str, Any]:
                 raise ProjectError("`face.mouth` requiere center [x, z] y width positivo.")
             item["mouth"] = {"center": list(mouth["center"]), "width": mouth["width"]}
             optional_number(mouth, "angle", -90, 90, item["mouth"])
+            optional_number(mouth, "tolerance", 0.02, 1, item["mouth"])
         if not item["eyes"] and "mouth" not in item:
             raise ProjectError("`face` requiere al menos un ojo o la boca.")
+        if "expressions" in face:
+            allowed = ("happy", "sad", "angry", "surprised")
+            if not isinstance(face["expressions"], list) or any(name not in allowed for name in face["expressions"]) or len(set(face["expressions"])) != len(face["expressions"]):
+                raise ProjectError("`face.expressions` admite una lista sin repetir de: " + ", ".join(allowed) + ".")
+            item["expressions"] = list(face["expressions"])
         for key in ("skin_sample", "line_sample"):
             if key in face:
                 if not _finite_numbers(face[key], 2):
                     raise ProjectError(f"`face.{key}` debe ser un punto [x, z].")
                 item[key] = list(face[key])
         clean["face"] = item
+
+    hands = spec.get("hands")
+    if hands:
+        if not isinstance(hands, list) or not 1 <= len(hands) <= 4:
+            raise ProjectError("`hands` requiere una lista de 1 a 4 manos.")
+        clean["hands"] = []
+        finger_names: set[str] = set()
+        for hand in hands:
+            if not isinstance(hand, dict) or not isinstance(hand.get("fingers"), list) or not 1 <= len(hand["fingers"]) <= 5:
+                raise ProjectError("Cada mano requiere bone y entre 1 y 5 dedos en `fingers`.")
+            item = {"bone": bone_name(hand.get("bone"), "`hands[].bone`"), "fingers": [], "collapse": []}
+            for finger in hand["fingers"]:
+                points = finger.get("points") if isinstance(finger, dict) else None
+                if (not isinstance(points, list) or len(points) != 4 or not all(_finite_numbers(point, 3) for point in points)
+                        or type(finger.get("radius")) not in (int, float) or not math.isfinite(finger["radius"]) or finger["radius"] <= 0):
+                    raise ProjectError("Cada dedo requiere name, radius positivo y points con 4 puntos [x, y, z] (base, dos nudillos y punta).")
+                name = bone_name(finger.get("name"), "El nombre de un dedo")
+                if len(name) > 48 or name in finger_names or any(math.dist(points[k], points[k + 1]) < 1e-5 for k in range(3)):
+                    raise ProjectError(f"El dedo `{name}` está repetido, tiene un nombre demasiado largo o un tramo de longitud cero.")
+                finger_names.add(name)
+                entry = {"name": name, "points": [list(point) for point in points], "radius": finger["radius"]}
+                optional_number(finger, "tip_scale", 0.3, 1.5, entry)
+                optional_number(finger, "knuckle", 0, 0.3, entry)
+                optional_number(finger, "flatten", 0.5, 1, entry)
+                item["fingers"].append(entry)
+            cuts = hand.get("collapse", [])
+            if not isinstance(cuts, list) or len(cuts) > 4:
+                raise ProjectError("`collapse` admite hasta 4 cortes por mano.")
+            for cut in cuts:
+                if (not isinstance(cut, dict) or not _finite_numbers(cut.get("point"), 3) or not _finite_numbers(cut.get("normal"), 3)
+                        or math.hypot(*cut["normal"]) < 1e-6 or type(cut.get("radius")) not in (int, float)
+                        or not math.isfinite(cut["radius"]) or cut["radius"] <= 0):
+                    raise ProjectError("Cada corte de `collapse` requiere point [x, y, z], normal [x, y, z] no nula y radius positivo.")
+                item["collapse"].append({"point": list(cut["point"]), "normal": list(cut["normal"]), "radius": cut["radius"]})
+            if "skin_sample" in hand:
+                if not _finite_numbers(hand["skin_sample"], 3):
+                    raise ProjectError("`hands[].skin_sample` debe ser un punto [x, y, z] sobre piel de la mano.")
+                item["skin_sample"] = list(hand["skin_sample"])
+            optional_number(hand, "skin_tolerance", 0.01, 1.5, item)
+            if "palm_normal" in hand:
+                if not _finite_numbers(hand["palm_normal"], 3) or math.hypot(*hand["palm_normal"]) < 1e-6:
+                    raise ProjectError("`hands[].palm_normal` debe ser una dirección [x, y, z] no nula.")
+                item["palm_normal"] = list(hand["palm_normal"])
+            clean["hands"].append(item)
     return clean
+
+
+def finger_bone_names(finger_name: str) -> list[str]:
+    """Bones created for one generated finger (VRM humanoid naming)."""
+    suffixes = ("Metacarpal", "Proximal", "Distal") if finger_name.endswith("Thumb") else ("Proximal", "Intermediate", "Distal")
+    return [finger_name + suffix for suffix in suffixes]
 
 
 def enhance_avatar3d(
@@ -720,10 +798,15 @@ def enhance_avatar3d(
     for section, key in (("secondary_bones", "parent"), ("face", "bone")):
         if section in request and request[section][key] not in bones:
             raise ProjectError(f"El GLB no contiene el hueso `{request[section][key]}`.")
-    if "secondary_bones" in request:
-        repeated = sorted(bones & {bone["name"] for bone in request["secondary_bones"]["bones"]})
-        if repeated:
-            raise ProjectError("El rig ya contiene estos huesos: " + ", ".join(repeated) + ".")
+    new_bones = [bone["name"] for bone in request.get("secondary_bones", {}).get("bones", [])]
+    for hand in request.get("hands", []):
+        if hand["bone"] not in bones:
+            raise ProjectError(f"El GLB no contiene el hueso `{hand['bone']}`.")
+        for finger in hand["fingers"]:
+            new_bones.extend(finger_bone_names(finger["name"]))
+    repeated = sorted((bones & set(new_bones)) | {name for name in new_bones if new_bones.count(name) > 1})
+    if repeated:
+        raise ProjectError("El rig ya contiene estos huesos o la solicitud los repite: " + ", ".join(repeated) + ".")
     if "face" in request and current["morph_targets"]:
         raise ProjectError("El avatar ya tiene morph targets (" + ", ".join(current["morph_targets"]) + "); no los duplico.")
     script = Path(__file__).with_name("blender_enhance.py")
@@ -764,10 +847,10 @@ def enhance_avatar3d(
             **_repair_lineage(info),
             "enhancements": enhancements,
         })
-    added = [name for name, present in (("morphs faciales", "face" in request), ("huesos secundarios", "secondary_bones" in request)) if present]
+    added = [name for name, present in (("morphs faciales", "face" in request), ("huesos secundarios", "secondary_bones" in request), ("dedos", "hands" in request)) if present]
     update_workflow(
         project_file, "needs_review", "avatar3d_review",
-        "Avatar mejorado con " + " y ".join(added) + " (reconstrucción). Revisa parpadeo, boca y movimiento del pelo en evidencias y en el visor.",
+        "Avatar mejorado con " + ", ".join(added) + " (reconstrucción). Revisa parpadeo, boca, dedos y movimiento del pelo en evidencias y en el visor.",
         100, f"avatar3d-enhance-{uuid.uuid4().hex[:8]}",
     )
     return {**attached, "avatar": load_project(project_file)["avatar3d"], "enhancement": report}
@@ -1037,7 +1120,7 @@ def validate_project_avatar(data: dict[str, Any], project_path: str | Path) -> d
         review = agent_state.get("review") if isinstance(agent_state, dict) else None
         if not (isinstance(review, dict) and review.get("source_sha256") == avatar.get("sha256") and review.get("verdict") == "pass"):
             validation_warnings.append(
-                "El avatar incluye reconstrucciones (morphs faciales o huesos secundarios) sin una revisión visual aprobada "
+                "El avatar incluye reconstrucciones (morphs faciales, dedos o huesos secundarios) sin una revisión visual aprobada "
                 "para esta versión: genera evidencias con `avatar3d evidence` y regístrala con `avatar3d review`."
             )
     if isinstance(deformation_validation, dict):

@@ -38,10 +38,24 @@ armatures = [obj for obj in bpy.context.scene.objects if obj.type == "ARMATURE"]
 if len(armatures) != 1:
     fail(f"Se esperaba un armature, encontré {len(armatures)}.")
 armature = armatures[0]
+bone_keys = [key for key in keyframes if "bone" in key]
+morph_keys = [key for key in keyframes if "morph" in key]
 known_bones = {bone.name for bone in armature.pose.bones}
-unknown = sorted({key["bone"] for key in keyframes} - known_bones)
+unknown = sorted({key["bone"] for key in bone_keys} - known_bones)
 if unknown:
     fail("El GLB no contiene estos huesos: " + ", ".join(unknown))
+# Meshes whose shape keys the clip animates, by morph name.
+morph_meshes = {}
+for obj in bpy.context.scene.objects:
+    if obj.type == "MESH" and obj.data.shape_keys:
+        for block in obj.data.shape_keys.key_blocks[1:]:
+            block.value = 0.0
+            morph_meshes.setdefault(block.name, []).append(obj)
+unknown = sorted({key["morph"] for key in morph_keys} - set(morph_meshes))
+if unknown:
+    fail("El GLB no contiene estos morphs: " + ", ".join(unknown))
+if morph_keys and not hasattr(bpy.types, "ActionSlot"):
+    fail("Animar morphs requiere Blender 4.4 o posterior (acciones con slots).")
 
 scene.frame_start = 0
 animation_data = armature.animation_data_create()
@@ -58,7 +72,7 @@ animation_data.action = action
 for pose_bone in armature.pose.bones:
     pose_bone.rotation_mode = "QUATERNION"
 
-for key in keyframes:
+for key in bone_keys:
     frame = int(key["frame"])
     scene.frame_set(frame)
     pose_bone = armature.pose.bones[key["bone"]]
@@ -68,6 +82,29 @@ for key in keyframes:
     local_delta = rest_orientation.inverted() @ semantic_delta @ rest_orientation
     pose_bone.rotation_quaternion = local_delta
     pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame, group=pose_bone.name)
+# Morph weights live in the same action, in one slot per animated shape-key block, so the exporter writes a
+# single glTF animation with bone and weight channels.
+morph_slots = {}
+for key in morph_keys:
+    for obj in morph_meshes[key["morph"]]:
+        shape_keys = obj.data.shape_keys
+        if shape_keys.name not in morph_slots:
+            data = shape_keys.animation_data_create()
+            data.action = action
+            slot = action.slots.new(id_type="KEY", name=shape_keys.name)
+            data.action_slot = slot
+            morph_slots[shape_keys.name] = (shape_keys, slot)
+            # Every morph of the block gets a curve: an unkeyed one would export its current value.
+            for block in shape_keys.key_blocks[1:]:
+                block.value = 0.0
+                block.keyframe_insert(data_path="value", frame=0)
+        block = shape_keys.key_blocks[key["morph"]]
+        block.value = float(key["value"])
+        block.keyframe_insert(data_path="value", frame=int(key["frame"]))
+for shape_keys, _slot in morph_slots.values():
+    for block in shape_keys.key_blocks[1:]:
+        block.value = 0.0
+scene.frame_set(0)
 for curve in getattr(action, "fcurves", []):
     for point in curve.keyframe_points:
         point.interpolation = "BEZIER"
@@ -89,6 +126,8 @@ try:
         export_animations=True,
         export_animation_mode="ACTIONS",
         export_frame_range=True,
+        export_morph=True,
+        export_morph_normal=False,
     )
 except Exception as exc:
     fail("Falló la exportación glTF de Blender: " + str(exc))
@@ -103,7 +142,8 @@ report = {
     "preserved_action_frame_ends": preserved_frame_ends,
     "rotation_space": "normalized_armature_xyz",
     "keyframe_count": len(keyframes),
-    "animated_bones": sorted({key["bone"] for key in keyframes}),
+    "animated_bones": sorted({key["bone"] for key in bone_keys}),
+    "animated_morphs": sorted({key["morph"] for key in morph_keys}),
     "interpolation": "BEZIER",
 }
 with open(report_path, "w", encoding="utf-8") as report_file:
