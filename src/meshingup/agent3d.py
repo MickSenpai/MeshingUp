@@ -24,8 +24,9 @@ def contract():
         'evidence_schema': {'shots': [{'name': 'arms_up', 'view': '|'.join(EVIDENCE_VIEWS),
             'pose': {'leftUpperArm': [0, -60, 0]}, 'morphs': {'blink': 1.0}, 'clip': {'name': 'Idle', 'frame': 12},
             'center': [0, 0, 0], 'scale': 1.0}],
-            'notes': 'Optional. pose uses the same semantic armature XYZ degrees as avatar3d animate; clip and pose are exclusive; up to 24 shots are rendered after the three rest views.'},
-        'enhance': 'avatar3d enhance --spec adds facial morph targets (blink, aa, ih, ou, ee, oh) and secondary bones as labelled reconstructions.',
+            'notes': 'Optional. pose uses the same semantic armature XYZ degrees as avatar3d animate; clip and pose are exclusive; a clip shot shows the morph weights animated by that clip unless morphs is given; up to 24 shots are rendered after the three rest views.'},
+        'enhance': 'avatar3d enhance --spec adds facial morph targets (blink, aa, ih, ou, ee, oh), separate fingers with VRM-named bones (`hands`) and secondary bones as labelled reconstructions.',
+        'animate': 'avatar3d animate --keyframes-file takes {frame, bone, rotation:[x,y,z]} and {frame, morph, value:0-1} keys; a clip may carry its own mouth shapes and blinks.',
         'review_schema': {'source_sha256': 'current avatar hash', 'evidence_id': 'evidence directory id',
             'reviewer': 'agent/model name', 'verdict': 'pass|needs_changes', 'findings': ['concrete observations']},
         'limits': 'No automatic AI provider calls. External vision agent must inspect evidence; reviews never set ready.'}

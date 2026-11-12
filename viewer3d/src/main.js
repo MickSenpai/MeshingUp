@@ -1967,8 +1967,29 @@ function applyPlan(plan) {
   showStatus(avatarDisplayName, `${currentPlan.state} · acción ${currentPlan.action || 'idle'}${gltfAnimations.length ? ` · ${gltfAnimations.length} clips` : ' · movimiento procedural'}`);
 }
 
+function lidExpressionAmount() {
+  let amount = 0;
+  avatarRoot?.traverse((mesh) => {
+    for (const name of ['happy', 'sad', 'angry']) {
+      const value = mesh.morphTargetInfluences?.[mesh.morphTargetDictionary?.[name]] || 0;
+      if (value > amount) amount = value;
+    }
+  });
+  return Math.min(1, amount);
+}
+
+const clipFaceCache = new WeakMap();
+function clipDrivesFace() {
+  if (!activeAction || !activeAction.isRunning()) return false;
+  const clip = activeAction.getClip();
+  if (!clipFaceCache.has(clip)) clipFaceCache.set(clip, clip.tracks.some((track) => track.name.includes('morphTargetInfluences')));
+  return clipFaceCache.get(clip);
+}
+
 function applySpeechPose() {
   const speaking = currentPlan.state === 'speaking';
+  // Live speech signals win over a clip's baked mouth; without them the clip's own mouth shapes play.
+  if (!speaking && clipDrivesFace()) return;
   const shape = speaking ? (currentPlan.viseme?.shape || 'silence') : 'silence';
   const visemeValues = VISEMES[shape] || {};
   const energy = speaking ? Math.max(0, Math.min(1, currentPlan.speech?.energy || 0)) : 0;
@@ -2128,7 +2149,10 @@ function animate(now) {
       blinkRemaining -= dt;
       blink = Math.max(0, Math.sin(Math.PI * (1 - blinkRemaining / 0.16)));
     }
-    setExpression('blink', blink);
+    // A clip that animates the face itself (a talking loop with mouth shapes and blinks) keeps its own morphs.
+    // Expressions that already move the eyelids (happy, sad, angry) leave less room for the blink: adding both
+    // would push the lids past the closed line.
+    if (!clipDrivesFace()) setExpression('blink', blink * (1 - lidExpressionAmount()));
     applySpeechPose();
     // Hair and other secondary bones follow with inertia, except while a pose is being edited by hand.
     if (secondaryMotion.count) {
@@ -2517,13 +2541,17 @@ window.meshingupAvatar = {
   setSecondaryMotion(enabled) { secondaryMotionEnabled = Boolean(enabled); if (!secondaryMotionEnabled && !manualPoseMode) secondaryMotion.reset(); return { enabled: secondaryMotionEnabled, bones: secondaryMotion.names() }; },
   // Read-only numbers for automated checks: current blink influence and the largest secondary-bone swing (radians).
   debugProbe() {
-    let blink = 0; let hairAngle = 0;
+    let blink = 0; let hairAngle = 0; let mouth = 0; let mouthShape = '';
     avatarRoot?.traverse((node) => {
       const index = node.morphTargetDictionary?.blink;
       if (index !== undefined && node.morphTargetInfluences) blink = Math.max(blink, node.morphTargetInfluences[index]);
+      for (const name of ['aa', 'ih', 'ou', 'ee', 'oh']) {
+        const value = node.morphTargetInfluences?.[node.morphTargetDictionary?.[name]] || 0;
+        if (value > mouth) { mouth = value; mouthShape = name; }
+      }
       if (node.isBone && secondaryMotion.names().includes(node.name)) hairAngle = Math.max(hairAngle, node.quaternion.angleTo(boneRestQuaternions.get(node) || node.quaternion));
     });
-    return { blink, hairAngle };
+    return { blink, hairAngle, mouth, mouthShape };
   },
   getSecondaryMotion() { return { enabled: secondaryMotionEnabled, bones: secondaryMotion.names() }; },
   getMorphTargets() { const names = new Set(); avatarRoot?.traverse((mesh) => { for (const key of Object.keys(mesh.morphTargetDictionary || {})) names.add(key); }); return [...names].sort(); },

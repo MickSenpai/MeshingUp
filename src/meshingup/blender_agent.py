@@ -59,6 +59,11 @@ else:
         rig.animation_data_clear()
         for bone in rig.pose.bones:
             bone.matrix_basis.identity()
+    # Rest views show the stored rest shape: no clip may leave a morph half applied.
+    shape_keys = [o.data.shape_keys for o in meshes if o.data.shape_keys]
+    for keys in shape_keys:
+        keys.animation_data_clear()
+        for key in keys.key_blocks[1:]: key.value = 0
     bpy.ops.object.camera_add()
     camera = bpy.context.object; camera.data.type='ORTHO'; camera.data.ortho_scale=size*1.25; scene.camera=camera
     for offset in [(1,-2,2),(-1,-1,1),(0,2,2)]:
@@ -92,6 +97,18 @@ else:
                 data.action_slot = data.action.slots[0]
             for bone in rig.pose.bones:
                 bone.matrix_basis.identity()
+        # A clip may also animate morph weights (a slot of the same action for each shape-key block).
+        clip_morphs = False
+        for keys in shape_keys:
+            action = bpy.data.actions[clip['name']] if clip else None
+            slots = [slot for slot in getattr(action, 'slots', []) if slot.target_id_type == 'KEY'] if action else []
+            slot = next((slot for slot in slots if slot.name_display == keys.name), slots[0] if slots else None)
+            data = keys.animation_data or keys.animation_data_create()
+            for track in data.nla_tracks: track.mute = True
+            data.action = action if slot else None
+            if slot:
+                data.action_slot = slot
+                clip_morphs = True
         scene.frame_set(clip['frame'] if clip else 0)
         for rig in rigs:
             for name, degrees in shot.get('pose', {}).items():
@@ -100,9 +117,10 @@ else:
                 rest = bone.bone.matrix_local.to_quaternion()
                 bone.rotation_mode = 'QUATERNION'
                 bone.rotation_quaternion = rest.inverted() @ Euler([math.radians(v) for v in degrees], 'XYZ').to_quaternion() @ rest
-        for obj in meshes:
-            if obj.data.shape_keys:
-                for key in obj.data.shape_keys.key_blocks[1:]: key.value = shot.get('morphs', {}).get(key.name, 0)
+        if not clip_morphs or shot.get('morphs'):
+            for keys in shape_keys:
+                keys.animation_data_clear()
+                for key in keys.key_blocks[1:]: key.value = shot.get('morphs', {}).get(key.name, 0)
         bpy.context.view_layer.update()
         target = Vector(shot['center']) if 'center' in shot else center
         camera.data.ortho_scale = shot.get('scale', size*1.25)

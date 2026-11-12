@@ -178,9 +178,10 @@ En el visor 3D, **Deshacer** y **Rehacer** (cabecera, junto a «Alinear vista»;
 
 ### Parpadeo, boca y pelo en un GLB riggeado
 
-`meshingupctl avatar3d enhance PROYECTO --spec mejora.json` (menú **Avatar 3D → Paso a paso → Añadir parpadeo, boca y pelo (JSON)…**) añade con Blender, sobre el GLB riggeado:
+`meshingupctl avatar3d enhance PROYECTO --spec mejora.json` (menú **Avatar 3D → Paso a paso → Añadir parpadeo, boca, dedos y pelo (JSON)…**) añade con Blender, sobre el GLB riggeado:
 
-- **Morphs faciales** `blink`, `aa`, `ih`, `ou`, `ee`, `oh` para caras pintadas en la textura: párpados y boca son parches pequeños ajustados a la superficie de la cara (por debajo del flequillo), sin área en reposo. El visor ya parpadea y aplica visemas con esos nombres.
+- **Morphs faciales** `blink`, `aa`, `ih`, `ou`, `ee`, `oh` y las expresiones `happy`, `sad`, `angry` y `surprised` (ojos en arco y sonrisa abierta, párpados caídos y boca hacia abajo, párpados inclinados, boca redonda; `face.expressions` elige cuáles) para caras pintadas en la textura: párpados y boca son parches pequeños ajustados a la superficie de la cara (por debajo del flequillo), reducidos a una miniatura invisible en reposo. El ojo pintado se localiza dentro del área indicada (colores que no son piel) y el párpado superior baja mientras el inferior sube hasta la línea de pestaña; su color se rellena desde la piel que rodea al ojo en una textura aparte (`…FaceAtlas`), sin tocar la textura original. La boca abierta tiene contorno, interior y lengua. El visor ya parpadea y aplica visemas con esos nombres.
+- **Dedos** (`hands`): para manos generadas como un bloque de dedos fusionado. Cada corte de `collapse` aplana la piel que queda más allá de un plano y la recoge bajo las bases de los dedos; cada dedo de `fingers` es una cápsula de tres falanges con sus huesos (`leftIndexProximal`/`Intermediate`/`Distal`, pulgar `Metacarpal`/`Proximal`/`Distal`, como en VRM) hijos del hueso de la mano. Los cuatro `points` son base, dos nudillos y punta; con `palm_normal` la sección se aplana un poco hacia la palma, y cada dedo se afina hacia la punta con un ligero abultamiento en los nudillos (`tip_scale`, `knuckle`, `flatten`).
 - **Huesos secundarios** (pelo, colas, lazos): hijos de un hueso existente que se reparten los pesos que ese hueso ya tenía, con una rampa a lo largo de cada hueso. El visor mueve con inercia los huesos cuyo nombre empieza por `hair`, `tail`, `ribbon`, `skirt`, `cape`, `scarf`, `ear`, `ahoge`, `ponytail`, `pigtail` o `braid` (casilla **Pelo con inercia**); no modifica el rig ni los clips.
 
 ```json
@@ -194,13 +195,19 @@ En el visor 3D, **Deshacer** y **Rehacer** (cabecera, junto a «Alinear vista»;
     "bone": "head",
     "eyes": [{"name": "left", "center": [0.15, 0.44], "radius": [0.078, 0.064]}],
     "mouth": {"center": [0.0245, 0.3145], "width": 0.075, "angle": 6}
-  }
+  },
+  "hands": [{
+    "bone": "leftHand", "palm_normal": [-0.96, 0, 0.27], "skin_sample": [0.352, -0.155, -0.276],
+    "collapse": [{"point": [0.345, -0.158, -0.243], "normal": [-0.27, 0.07, -0.96], "radius": 0.075}],
+    "fingers": [{"name": "leftIndex", "radius": 0.0103,
+                 "points": [[0.347, -0.188, -0.235], [0.340, -0.188, -0.257], [0.335, -0.189, -0.272], [0.330, -0.189, -0.286]]}]
+  }]
 }
 ```
 
-Las coordenadas son las de Blender tras importar el GLB (X lateral, Y profundidad con la cara mirando a −Y, Z arriba), las mismas de `geometry.json`; `center` de ojos y boca es `[x, z]` en la vista frontal. Todo lo añadido es **reconstrucción**, no geometría observada: queda registrado en `avatar3d.enhancements` con la solicitud, el informe y el hash del GLB de origen, el GLB anterior se conserva, el proyecto vuelve a `needs_review` y la validación impide `ready` hasta registrar una revisión `pass` de esa versión. No crea dedos ni separa el pelo de los hombros.
+Las coordenadas son las de Blender tras importar el GLB (X lateral, Y profundidad con la cara mirando a −Y, Z arriba), las mismas de `geometry.json`; `center` de ojos y boca es `[x, z]` en la vista frontal. Todo lo añadido es **reconstrucción**, no geometría observada: queda registrado en `avatar3d.enhancements` con la solicitud, el informe y el hash del GLB de origen, el GLB anterior se conserva, el proyecto vuelve a `needs_review` y la validación impide `ready` hasta registrar una revisión `pass` de esa versión. Los dedos generados son cápsulas de color de piel plano; no separa el pelo de los hombros.
 
-`meshingupctl avatar3d create MODELO.glb PROYECTO.meshingup` crea un proyecto 3D-only sin pasar por la interfaz. `avatar3d animate` acepta además `--keyframes-file claves.json` (lista de `{frame, bone, rotation}`), y `avatar3d evidence --request tomas.json` renderiza, además de las tres vistas de reposo, hasta 24 tomas con poses (`pose`), morphs (`morphs`) o fotogramas de clips (`clip`); el esquema está en `avatar3d agent-contract`.
+`meshingupctl avatar3d create MODELO.glb PROYECTO.meshingup` crea un proyecto 3D-only sin pasar por la interfaz. `avatar3d animate` acepta además `--keyframes-file claves.json`: una lista de `{frame, bone, rotation}` y, para que un clip lleve su propia boca y parpadeo, `{frame, morph, value}` con valores entre 0 y 1 (requiere Blender 4.4 o posterior). El visor reproduce esos morphs del clip y sólo los sustituye por los visemas en vivo cuando hay señal de voz, y `avatar3d evidence --request tomas.json` renderiza, además de las tres vistas de reposo, hasta 24 tomas con poses (`pose`), morphs (`morphs`) o fotogramas de clips (`clip`); el esquema está en `avatar3d agent-contract`.
 
 La CLI equivalente al botón de Blender es `meshingupctl avatar3d autorig PROYECTO`. Para que un agente genere un clip 3D, `meshingupctl avatar3d animate PROYECTO NOMBRE --duration 48 --fps 24` acepta claves repetidas `--keyframe FOTOGRAMA HUESO RX RY RZ`; esos ángulos XYZ se interpretan en los ejes semánticos normalizados del rig y se convierten a los ejes locales de cada hueso. Los clips anteriores conservan su duración en segundos al agregar clips con otra frecuencia; el visor permite seleccionar y reproducir clips por nombre. Por ejemplo, el agente puede dar claves para `leftUpperArm` en los fotogramas 0, 12, 24 y 48 para un saludo, previsualizarlo y ajustar sus ángulos. Las animaciones de habla usan señales de visemas/energía que debe enviar la integración TTS; MeshingUp aún no genera fonemas desde texto ni se conecta en vivo con Meido.
 

@@ -48,7 +48,7 @@ la infraestructura sobre copias, no repara el personaje final.
 Las evidencias ya admiten tomas con poses, morphs y fotogramas de clips
 (`avatar3d evidence --request`), así que el límite «sólo reposo» queda resuelto
 para renders estáticos; sigue sin haber vídeo ni métrica automática de
-penetración. `tests/test_enhance3d.py` cubre la validación de solicitudes de
+penetración. `tests/test_enhance3d.py` cubre la validación de solicitudes de dedos (`hands`), de claves de morph en `animate` y de
 `enhance` y de tomas, la lectura de morph targets y el bloqueo de `ready` para
 reconstrucciones sin revisión. El caso Meido pulido se describe en
 `docs/SESION_CAMBIOS.md`.

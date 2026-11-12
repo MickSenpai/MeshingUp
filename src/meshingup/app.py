@@ -1012,7 +1012,7 @@ class MainWindow(QMainWindow):
             "Suelda vértices duplicados por costuras y quita geometría muerta. El GLB original se conserva intacto; no rellena agujeros."
         )
         self.avatar3d_repair_button.triggered.connect(self._repair_avatar3d_mesh)
-        self.avatar3d_enhance_button = QAction("Añadir parpadeo, boca y pelo (JSON)…", self)
+        self.avatar3d_enhance_button = QAction("Añadir parpadeo, boca, dedos y pelo (JSON)…", self)
         self.avatar3d_enhance_button.setEnabled(False)
         self.avatar3d_enhance_button.setToolTip(
             "Aplica una solicitud JSON de `meshingupctl avatar3d enhance`: morphs faciales (blink, aa…) y huesos secundarios "

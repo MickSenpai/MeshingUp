@@ -969,7 +969,9 @@ def validate_project(path: str | Path) -> dict[str, Any]:
                 break
             visited.add(node)
             stack.extend((neighbor, node) for neighbor in adjacency[node] if neighbor != parent)
-    if not joints:
+    # A 3D-only project (no source illustration) has no 2D rig to complete: its pending work is the avatar's.
+    avatar_only = not data.get("image") and isinstance(data.get("avatar3d"), dict)
+    if not joints and not avatar_only:
         warnings.append("El proyecto aún no tiene pivotes.")
     if joints and not bones:
         warnings.append("El proyecto tiene pivotes, pero ningún hueso conectado.")
@@ -1001,9 +1003,9 @@ def validate_project(path: str | Path) -> dict[str, Any]:
         warnings.append("Falta configurar mallas deformables y pesos.")
     expressions = data.get("expressions", [])
     animations = data.get("animations", [])
-    if not expressions:
+    if not expressions and not avatar_only:
         warnings.append("Faltan expresiones faciales.")
-    if not animations:
+    if not animations and not avatar_only:
         warnings.append("Faltan clips de animación.")
     for clip in animations:
         for joint_id, track in clip.get("tracks", {}).items():
@@ -1028,7 +1030,7 @@ def validate_project(path: str | Path) -> dict[str, Any]:
         layer_ids = {layer.get("id") for layer in layers}
         if any(layer_id not in layer_ids for layer_id in expression.get("layer_opacities", {})):
             errors.append(f"La expresión {expression.get('name', expression.get('id'))} apunta a una capa inexistente.")
-    if not layers:
+    if not layers and not avatar_only:
         warnings.append("Falta separar las capas del personaje.")
     return {
         "project": str(project_path),
